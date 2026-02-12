@@ -182,7 +182,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
     'User-Agent': customHeaders['User-Agent'] || customHeaders['user-agent'] || DEFAULT_USER_AGENT,
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
+    // Don't request compressed content to avoid decoding issues when proxying
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Connection': 'keep-alive',
@@ -217,22 +217,30 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
     : '';
 
   for (const line of lines) {
-    if (line.trim() === '' || line.startsWith('#')) {
+    const trimmedLine = line.trim();
+    
+    // Skip empty lines and comments (lines starting with #)
+    if (trimmedLine === '' || trimmedLine.startsWith('#')) {
       rewrittenLines.push(line);
       continue;
     }
 
     try {
-      const absoluteUrl = new URL(line, baseUrl).href;
+      // Any non-comment line in M3U8 should be a URL
+      // Convert to absolute URL
+      const absoluteUrl = new URL(trimmedLine, baseUrl).href;
       
-      // Determine if it's a segment or playlist
-      const isSegment = absoluteUrl.match(/\.(ts|m4s|mp4|m3u8)(\?.*)?$/i);
-      const endpoint = isSegment ? '/ts-proxy' : '/m3u8-proxy';
+      // Determine if it's a playlist or segment
+      // .m3u8 files are playlists, everything else is a segment
+      const isPlaylist = absoluteUrl.match(/\.m3u8(\?.*)?$/i);
+      const endpoint = isPlaylist ? '/m3u8-proxy' : '/ts-proxy';
       
       const proxiedUrl = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(absoluteUrl)}${headersParam}`;
       rewrittenLines.push(proxiedUrl);
+      
+      console.log(`Rewrote [${endpoint}]: ${trimmedLine.substring(0, 60)}...`);
     } catch (error) {
-      console.warn('Failed to rewrite line:', line, error.message);
+      console.warn('Failed to rewrite line:', trimmedLine, error.message);
       rewrittenLines.push(line);
     }
   }
@@ -726,18 +734,19 @@ function entriesToSRT(entries) {
 
 // 404 handler
 app.use((req, res) => {
-  res.status(404).type('text/plain').send(`Not Found
-
-Available endpoints:
-  /health
-  /m3u8-proxy?url=<url>&headers=<json_headers>
-  /m3u8-proxy-no-referer?url=<url>&headers=<json_headers>
-  /ts-proxy?url=<url>&headers=<json_headers>
-  /mp4-proxy?url=<url>&headers=<json_headers>
-  /fetch?url=<url>&headers=<json_headers>
-  /fetch-no-referer?url=<url>&headers=<json_headers>
-  /subtitle?url=<subtitle_url>&headers=<json_headers>
-`);
+  res.status(404).json({
+    error: 'Not Found',
+    availableEndpoints: [
+      '/health',
+      '/m3u8-proxy?url=<url>&headers=<json_headers>',
+      '/m3u8-proxy-no-referer?url=<url>&headers=<json_headers>',
+      '/ts-proxy?url=<url>&headers=<json_headers>',
+      '/mp4-proxy?url=<url>&headers=<json_headers>',
+      '/fetch?url=<url>&headers=<json_headers>',
+      '/fetch-no-referer?url=<url>&headers=<json_headers>',
+      '/subtitle?url=<subtitle_url>&headers=<json_headers>'
+    ]
+  });
 });
 
 // Error handler
