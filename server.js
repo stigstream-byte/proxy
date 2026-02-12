@@ -182,7 +182,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
     'User-Agent': customHeaders['User-Agent'] || customHeaders['user-agent'] || DEFAULT_USER_AGENT,
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
-    // Don't request compressed content to avoid decoding issues when proxying
+    'Accept-Encoding': 'identity', // Explicitly disable compression to avoid decoding issues when proxying
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Connection': 'keep-alive',
