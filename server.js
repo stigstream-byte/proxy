@@ -212,6 +212,10 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
   const lines = m3u8Content.split('\n');
   const rewrittenLines = [];
   
+  console.log('🔧 Rewriting M3U8 with baseUrl:', baseUrl);
+  console.log('🔧 Proxy base URL:', proxyBaseUrl);
+  console.log('🔧 Include referer:', includeReferer);
+  
   const headersParam = Object.keys(customHeaders).length > 0 
     ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
     : '';
@@ -246,6 +250,14 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
       if (uriMatch) {
         try {
           const originalUri = uriMatch[1];
+          
+          // Skip if already proxied
+          if (originalUri.includes(proxyBaseUrl)) {
+            console.log(`⏭️  Skipping already proxied URI`);
+            rewrittenLines.push(line);
+            continue;
+          }
+          
           const absoluteUrl = new URL(originalUri, baseUrl).href;
           const proxiedUrl = createProxiedUrl(absoluteUrl);
           const rewrittenLine = line.replace(/URI="[^"]+"/, `URI="${proxiedUrl}"`);
@@ -267,6 +279,13 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
     }
 
     try {
+      // Skip if already proxied
+      if (trimmedLine.includes(proxyBaseUrl)) {
+        console.log(`⏭️  Skipping already proxied URL`);
+        rewrittenLines.push(line);
+        continue;
+      }
+      
       // Any non-comment line in M3U8 should be a URL
       // Convert to absolute URL
       const absoluteUrl = new URL(trimmedLine, baseUrl).href;
@@ -308,15 +327,21 @@ app.get('/m3u8-proxy', async (req, res) => {
     const customHeaders = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
+    console.log('🔄 Fetching M3U8 with headers:', Object.keys(requestHeaders).join(', '));
+
     const targetResponse = await fetchWithRetry(targetUrl, {
       headers: requestHeaders
     });
 
     if (!targetResponse.ok) {
-      console.error('❌ M3U8 fetch failed:', targetResponse.status);
+      console.error('❌ M3U8 fetch failed:', targetResponse.status, targetResponse.statusText);
+      const errorText = await targetResponse.text().catch(() => 'Unable to read error response');
+      console.error('Response body:', errorText.substring(0, 200));
       return res.status(targetResponse.status).json({
         error: 'Failed to fetch M3U8',
-        status: targetResponse.status
+        status: targetResponse.status,
+        statusText: targetResponse.statusText,
+        url: targetUrl
       });
     }
 
@@ -333,11 +358,21 @@ app.get('/m3u8-proxy', async (req, res) => {
     res.send(m3u8Content);
 
   } catch (error) {
-    console.error('❌ M3U8 proxy error:', error);
+    console.error('❌ M3U8 proxy error:', error.message);
+    console.error('Error type:', error.name);
+    console.error('Stack:', error.stack);
+    
+    // Check if headers were already sent
+    if (res.headersSent) {
+      console.error('Headers already sent, cannot send error response');
+      return;
+    }
+    
     res.status(502).json({
       error: 'Proxy error',
       message: error.message,
-      type: error.name
+      type: error.name,
+      url: targetUrl
     });
   }
 });
@@ -364,15 +399,21 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
 
     const requestHeaders = buildRequestHeaders(customHeaders, false);
 
+    console.log('🔄 Fetching M3U8 (No Referer) with headers:', Object.keys(requestHeaders).join(', '));
+
     const targetResponse = await fetchWithRetry(targetUrl, {
       headers: requestHeaders
     });
 
     if (!targetResponse.ok) {
-      console.error('❌ M3U8 fetch failed:', targetResponse.status);
+      console.error('❌ M3U8 fetch failed:', targetResponse.status, targetResponse.statusText);
+      const errorText = await targetResponse.text().catch(() => 'Unable to read error response');
+      console.error('Response body:', errorText.substring(0, 200));
       return res.status(targetResponse.status).json({
         error: 'Failed to fetch M3U8',
-        status: targetResponse.status
+        status: targetResponse.status,
+        statusText: targetResponse.statusText,
+        url: targetUrl
       });
     }
 
@@ -389,11 +430,21 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
     res.send(m3u8Content);
 
   } catch (error) {
-    console.error('❌ M3U8 proxy error (No Referer):', error);
+    console.error('❌ M3U8 proxy error (No Referer):', error.message);
+    console.error('Error type:', error.name);
+    console.error('Stack:', error.stack);
+    
+    // Check if headers were already sent
+    if (res.headersSent) {
+      console.error('Headers already sent, cannot send error response');
+      return;
+    }
+    
     res.status(502).json({
       error: 'Proxy error',
       message: error.message,
-      type: error.name
+      type: error.name,
+      url: targetUrl
     });
   }
 });
