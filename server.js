@@ -182,7 +182,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
     'User-Agent': customHeaders['User-Agent'] || customHeaders['user-agent'] || DEFAULT_USER_AGENT,
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'identity', // Explicitly disable compression to avoid decoding issues when proxying
+    // Don't request compressed content to avoid decoding issues when proxying
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Connection': 'keep-alive',
@@ -208,7 +208,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
 /**
  * Rewrite M3U8 content to proxy URLs
  */
-function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}) {
+function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}, includeReferer = true) {
   const lines = m3u8Content.split('\n');
   const rewrittenLines = [];
   
@@ -233,7 +233,19 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
       // Determine if it's a playlist or segment
       // .m3u8 files are playlists, everything else is a segment
       const isPlaylist = absoluteUrl.match(/\.m3u8(\?.*)?$/i);
-      const endpoint = isPlaylist ? '/m3u8-proxy' : '/ts-proxy';
+      
+      // Check for audio file extensions
+      const isAudioSegment = absoluteUrl.match(/\.(aac|mp3|m4a|ac3|eac3|mp4a)(\?.*)?$/i);
+      
+      // Route to appropriate endpoint based on type and referer setting
+      let endpoint;
+      if (isPlaylist) {
+        endpoint = includeReferer ? '/m3u8-proxy' : '/m3u8-proxy-no-referer';
+      } else if (isAudioSegment) {
+        endpoint = includeReferer ? '/fetch' : '/fetch-no-referer';
+      } else {
+        endpoint = '/ts-proxy'; // TS segments don't have a no-referer variant
+      }
       
       const proxiedUrl = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(absoluteUrl)}${headersParam}`;
       rewrittenLines.push(proxiedUrl);
@@ -290,7 +302,7 @@ app.get('/m3u8-proxy', async (req, res) => {
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const proxyBaseUrl = `${req.protocol}://${req.get('host')}`;
-    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
+    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders, true);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
@@ -346,7 +358,7 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const proxyBaseUrl = `${req.protocol}://${req.get('host')}`;
-    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
+    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders, false);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
