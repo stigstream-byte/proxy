@@ -10,47 +10,19 @@ const AbortController = require('abort-controller');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Limit concurrent connections for low-memory servers
-const MAX_CONCURRENT_REQUESTS = 20;
-let activeRequests = 0;
-
-app.use((req, res, next) => {
-  if (activeRequests >= MAX_CONCURRENT_REQUESTS) {
-    return res.status(503).json({ 
-      error: 'Server busy', 
-      message: 'Too many concurrent requests, please retry' 
-    });
-  }
-  activeRequests++;
-  res.on('finish', () => activeRequests--);
-  res.on('close', () => activeRequests--);
-  next();
-});
-
-// Retry configuration for robust fetching - optimized for low-memory servers
+// Retry configuration for robust fetching - optimized for speed
 const RETRY_CONFIG = {
-  maxRetries: 1, // Reduced from 2 for low-memory servers
+  maxRetries: 2,
   initialDelay: 25,
-  maxDelay: 200, // Reduced from 300
+  maxDelay: 300,
   backoffMultiplier: 2
 };
 
-const TIMEOUT_MS = 30000; // 30 second timeout for M3U8 (increased for low-resource servers)
-const SEGMENT_TIMEOUT_MS = 20000; // 20 second timeout for segments
+const TIMEOUT_MS = 15000; // 15 second timeout for M3U8
+const SEGMENT_TIMEOUT_MS = 10000; // 10 second timeout for segments
 
 // Request deduplication map
 const pendingRequests = new Map();
-
-// Clear old pending requests every 30 seconds to prevent memory leaks
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, value] of pendingRequests.entries()) {
-    // Remove requests older than 30 seconds
-    if (value.timestamp && now - value.timestamp > 30000) {
-      pendingRequests.delete(key);
-    }
-  }
-}, 30000);
 
 // More realistic User-Agent (matches common browsers)
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -80,8 +52,7 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
   const requestKey = `${url}:${JSON.stringify(options?.headers || {})}`;
   if (pendingRequests.has(requestKey)) {
     try {
-      const pending = pendingRequests.get(requestKey);
-      return await (pending.promise || pending);
+      return await pendingRequests.get(requestKey);
     } catch (error) {
       // If the pending request failed, continue to try again
     }
@@ -91,8 +62,6 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
   let delay = RETRY_CONFIG.initialDelay;
 
   const fetchPromise = (async () => {
-    const startTime = Date.now();
-    
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const controller = new AbortController();
@@ -134,7 +103,7 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
     throw lastError;
   })();
 
-  pendingRequests.set(requestKey, { promise: fetchPromise, timestamp: Date.now() });
+  pendingRequests.set(requestKey, fetchPromise);
   return fetchPromise;
 }
 
@@ -213,7 +182,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
     'User-Agent': customHeaders['User-Agent'] || customHeaders['user-agent'] || DEFAULT_USER_AGENT,
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
-    // Don't request compressed content to avoid decoding issues when proxying
+    'Accept-Encoding': 'identity', // Explicitly disable compression to avoid decoding issues when proxying
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Connection': 'keep-alive',
@@ -239,7 +208,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
 /**
  * Rewrite M3U8 content to proxy URLs
  */
-function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}, includeReferer = true) {
+function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}) {
   const lines = m3u8Content.split('\n');
   const rewrittenLines = [];
   
@@ -247,76 +216,31 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
     ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
     : '';
 
-  // Helper function to determine the endpoint for a URL
-  function getEndpointForUrl(url) {
-    const isPlaylist = url.match(/\.m3u8(\?.*)?$/i);
-    const isAudioSegment = url.match(/\.(aac|mp3|m4a|ac3|eac3|mp4a)(\?.*)?$/i);
-    
-    if (isPlaylist) {
-      return includeReferer ? '/m3u8-proxy' : '/m3u8-proxy-no-referer';
-    } else if (isAudioSegment) {
-      return includeReferer ? '/fetch' : '/fetch-no-referer';
-    } else {
-      return '/ts-proxy'; // TS segments don't have a no-referer variant
-    }
-  }
-
-  // Helper function to create proxied URL
-  function createProxiedUrl(url) {
-    const endpoint = getEndpointForUrl(url);
-    return `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(url)}${headersParam}`;
-  }
-
   for (const line of lines) {
     const trimmedLine = line.trim();
     
-    // Check if this is a #EXT-X-MEDIA or similar tag with URI attribute
-    if (trimmedLine.startsWith('#EXT-X-MEDIA:') || trimmedLine.startsWith('#EXT-X-I-FRAME-STREAM-INF:')) {
-      // Extract and rewrite URI attribute
-      const uriMatch = line.match(/URI="([^"]+)"/);
-      if (uriMatch) {
-        try {
-          const originalUri = uriMatch[1];
-          
-          // Skip if already proxied
-          if (originalUri.includes(proxyBaseUrl)) {
-            rewrittenLines.push(line);
-            continue;
-          }
-          
-          const absoluteUrl = new URL(originalUri, baseUrl).href;
-          const proxiedUrl = createProxiedUrl(absoluteUrl);
-          const rewrittenLine = line.replace(/URI="[^"]+"/, `URI="${proxiedUrl}"`);
-          rewrittenLines.push(rewrittenLine);
-          continue;
-        } catch (error) {
-          console.warn('Failed to rewrite URI:', error.message);
-        }
-      }
-      rewrittenLines.push(line);
-      continue;
-    }
-    
-    // Skip other comment lines and empty lines
+    // Skip empty lines and comments (lines starting with #)
     if (trimmedLine === '' || trimmedLine.startsWith('#')) {
       rewrittenLines.push(line);
       continue;
     }
 
     try {
-      // Skip if already proxied
-      if (trimmedLine.includes(proxyBaseUrl)) {
-        rewrittenLines.push(line);
-        continue;
-      }
-      
       // Any non-comment line in M3U8 should be a URL
       // Convert to absolute URL
       const absoluteUrl = new URL(trimmedLine, baseUrl).href;
-      const proxiedUrl = createProxiedUrl(absoluteUrl);
+      
+      // Determine if it's a playlist or segment
+      // .m3u8 files are playlists, everything else is a segment
+      const isPlaylist = absoluteUrl.match(/\.m3u8(\?.*)?$/i);
+      const endpoint = isPlaylist ? '/m3u8-proxy' : '/ts-proxy';
+      
+      const proxiedUrl = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(absoluteUrl)}${headersParam}`;
       rewrittenLines.push(proxiedUrl);
+      
+      console.log(`Rewrote [${endpoint}]: ${trimmedLine.substring(0, 60)}...`);
     } catch (error) {
-      console.warn('Failed to rewrite line:', error.message);
+      console.warn('Failed to rewrite line:', trimmedLine, error.message);
       rewrittenLines.push(line);
     }
   }
@@ -342,7 +266,7 @@ app.get('/m3u8-proxy', async (req, res) => {
     return res.status(400).json({ error: urlValidation.error });
   }
 
-  console.log('📺 M3U8:', targetUrl.substring(0, 80));
+  console.log('📺 M3U8 Request:', targetUrl);
 
   try {
     const customHeaders = parseCustomHeaders(req.query);
@@ -353,34 +277,31 @@ app.get('/m3u8-proxy', async (req, res) => {
     });
 
     if (!targetResponse.ok) {
-      console.error('❌ M3U8 failed:', targetResponse.status);
-      const errorText = await targetResponse.text().catch(() => '');
+      console.error('❌ M3U8 fetch failed:', targetResponse.status);
       return res.status(targetResponse.status).json({
         error: 'Failed to fetch M3U8',
-        status: targetResponse.status,
-        url: targetUrl.substring(0, 100)
+        status: targetResponse.status
       });
     }
 
     let m3u8Content = await targetResponse.text();
+    console.log('✅ M3U8 fetched, size:', m3u8Content.length);
 
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const proxyBaseUrl = `${req.protocol}://${req.get('host')}`;
-    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders, true);
+    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
     res.send(m3u8Content);
 
   } catch (error) {
-    console.error('❌ M3U8 error:', error.message);
-    
-    if (res.headersSent) return;
-    
+    console.error('❌ M3U8 proxy error:', error);
     res.status(502).json({
       error: 'Proxy error',
-      message: error.message
+      message: error.message,
+      type: error.name
     });
   }
 });
@@ -398,7 +319,7 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
     return res.status(400).json({ error: urlValidation.error });
   }
 
-  console.log('📺 M3U8 (No Ref):', targetUrl.substring(0, 80));
+  console.log('📺 M3U8 Request (No Referer):', targetUrl);
 
   try {
     let customHeaders = parseCustomHeaders(req.query);
@@ -412,34 +333,31 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
     });
 
     if (!targetResponse.ok) {
-      console.error('❌ M3U8 failed:', targetResponse.status);
-      const errorText = await targetResponse.text().catch(() => '');
+      console.error('❌ M3U8 fetch failed:', targetResponse.status);
       return res.status(targetResponse.status).json({
         error: 'Failed to fetch M3U8',
-        status: targetResponse.status,
-        url: targetUrl.substring(0, 100)
+        status: targetResponse.status
       });
     }
 
     let m3u8Content = await targetResponse.text();
+    console.log('✅ M3U8 fetched (No Referer), size:', m3u8Content.length);
 
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const proxyBaseUrl = `${req.protocol}://${req.get('host')}`;
-    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders, false);
+    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
     res.send(m3u8Content);
 
   } catch (error) {
-    console.error('❌ M3U8 error (No Ref):', error.message);
-    
-    if (res.headersSent) return;
-    
+    console.error('❌ M3U8 proxy error (No Referer):', error);
     res.status(502).json({
       error: 'Proxy error',
-      message: error.message
+      message: error.message,
+      type: error.name
     });
   }
 });
