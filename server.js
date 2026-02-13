@@ -10,11 +10,28 @@ const AbortController = require('abort-controller');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Retry configuration for robust fetching - optimized for speed
+// Limit concurrent connections for low-memory servers
+const MAX_CONCURRENT_REQUESTS = 20;
+let activeRequests = 0;
+
+app.use((req, res, next) => {
+  if (activeRequests >= MAX_CONCURRENT_REQUESTS) {
+    return res.status(503).json({ 
+      error: 'Server busy', 
+      message: 'Too many concurrent requests, please retry' 
+    });
+  }
+  activeRequests++;
+  res.on('finish', () => activeRequests--);
+  res.on('close', () => activeRequests--);
+  next();
+});
+
+// Retry configuration for robust fetching - optimized for low-memory servers
 const RETRY_CONFIG = {
-  maxRetries: 2,
+  maxRetries: 1, // Reduced from 2 for low-memory servers
   initialDelay: 25,
-  maxDelay: 300,
+  maxDelay: 200, // Reduced from 300
   backoffMultiplier: 2
 };
 
@@ -23,6 +40,17 @@ const SEGMENT_TIMEOUT_MS = 20000; // 20 second timeout for segments
 
 // Request deduplication map
 const pendingRequests = new Map();
+
+// Clear old pending requests every 30 seconds to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of pendingRequests.entries()) {
+    // Remove requests older than 30 seconds
+    if (value.timestamp && now - value.timestamp > 30000) {
+      pendingRequests.delete(key);
+    }
+  }
+}, 30000);
 
 // More realistic User-Agent (matches common browsers)
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -52,7 +80,8 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
   const requestKey = `${url}:${JSON.stringify(options?.headers || {})}`;
   if (pendingRequests.has(requestKey)) {
     try {
-      return await pendingRequests.get(requestKey);
+      const pending = pendingRequests.get(requestKey);
+      return await (pending.promise || pending);
     } catch (error) {
       // If the pending request failed, continue to try again
     }
@@ -62,6 +91,8 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
   let delay = RETRY_CONFIG.initialDelay;
 
   const fetchPromise = (async () => {
+    const startTime = Date.now();
+    
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const controller = new AbortController();
@@ -103,7 +134,7 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
     throw lastError;
   })();
 
-  pendingRequests.set(requestKey, fetchPromise);
+  pendingRequests.set(requestKey, { promise: fetchPromise, timestamp: Date.now() });
   return fetchPromise;
 }
 
