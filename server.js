@@ -216,10 +216,51 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
     ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
     : '';
 
+  // Helper function to determine the endpoint for a URL
+  function getEndpointForUrl(url) {
+    const isPlaylist = url.match(/\.m3u8(\?.*)?$/i);
+    const isAudioSegment = url.match(/\.(aac|mp3|m4a|ac3|eac3|mp4a)(\?.*)?$/i);
+    
+    if (isPlaylist) {
+      return includeReferer ? '/m3u8-proxy' : '/m3u8-proxy-no-referer';
+    } else if (isAudioSegment) {
+      return includeReferer ? '/fetch' : '/fetch-no-referer';
+    } else {
+      return '/ts-proxy'; // TS segments don't have a no-referer variant
+    }
+  }
+
+  // Helper function to create proxied URL
+  function createProxiedUrl(url) {
+    const endpoint = getEndpointForUrl(url);
+    return `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(url)}${headersParam}`;
+  }
+
   for (const line of lines) {
     const trimmedLine = line.trim();
     
-    // Skip empty lines and comments (lines starting with #)
+    // Check if this is a #EXT-X-MEDIA or similar tag with URI attribute
+    if (trimmedLine.startsWith('#EXT-X-MEDIA:') || trimmedLine.startsWith('#EXT-X-I-FRAME-STREAM-INF:')) {
+      // Extract and rewrite URI attribute
+      const uriMatch = line.match(/URI="([^"]+)"/);
+      if (uriMatch) {
+        try {
+          const originalUri = uriMatch[1];
+          const absoluteUrl = new URL(originalUri, baseUrl).href;
+          const proxiedUrl = createProxiedUrl(absoluteUrl);
+          const rewrittenLine = line.replace(/URI="[^"]+"/, `URI="${proxiedUrl}"`);
+          rewrittenLines.push(rewrittenLine);
+          console.log(`Rewrote URI in ${trimmedLine.split(':')[0]}: ${originalUri.substring(0, 60)}...`);
+          continue;
+        } catch (error) {
+          console.warn('Failed to rewrite URI in line:', trimmedLine, error.message);
+        }
+      }
+      rewrittenLines.push(line);
+      continue;
+    }
+    
+    // Skip other comment lines and empty lines
     if (trimmedLine === '' || trimmedLine.startsWith('#')) {
       rewrittenLines.push(line);
       continue;
@@ -229,27 +270,10 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
       // Any non-comment line in M3U8 should be a URL
       // Convert to absolute URL
       const absoluteUrl = new URL(trimmedLine, baseUrl).href;
-      
-      // Determine if it's a playlist or segment
-      // .m3u8 files are playlists, everything else is a segment
-      const isPlaylist = absoluteUrl.match(/\.m3u8(\?.*)?$/i);
-      
-      // Check for audio file extensions
-      const isAudioSegment = absoluteUrl.match(/\.(aac|mp3|m4a|ac3|eac3|mp4a)(\?.*)?$/i);
-      
-      // Route to appropriate endpoint based on type and referer setting
-      let endpoint;
-      if (isPlaylist) {
-        endpoint = includeReferer ? '/m3u8-proxy' : '/m3u8-proxy-no-referer';
-      } else if (isAudioSegment) {
-        endpoint = includeReferer ? '/fetch' : '/fetch-no-referer';
-      } else {
-        endpoint = '/ts-proxy'; // TS segments don't have a no-referer variant
-      }
-      
-      const proxiedUrl = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(absoluteUrl)}${headersParam}`;
+      const proxiedUrl = createProxiedUrl(absoluteUrl);
       rewrittenLines.push(proxiedUrl);
       
+      const endpoint = getEndpointForUrl(absoluteUrl);
       console.log(`Rewrote [${endpoint}]: ${trimmedLine.substring(0, 60)}...`);
     } catch (error) {
       console.warn('Failed to rewrite line:', trimmedLine, error.message);
