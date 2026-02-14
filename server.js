@@ -62,45 +62,48 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
   let delay = RETRY_CONFIG.initialDelay;
 
   const fetchPromise = (async () => {
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-        const response = await fetch(url, {
-          ...options,
-          signal: controller.signal
-        });
+          const response = await fetch(url, {
+            ...options,
+            signal: controller.signal
+          });
 
-        clearTimeout(timeoutId);
+          clearTimeout(timeoutId);
 
-        // Only retry on specific status codes (5xx and 429)
-        if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
-          pendingRequests.delete(requestKey);
-          return response;
+          // Only retry on specific status codes (5xx and 429)
+          if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
+            return response;
+          }
+
+          lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+          console.warn(`⚠️ Attempt ${attempt + 1} failed: ${lastError.message}`);
+
+        } catch (error) {
+          lastError = error;
+          console.warn(`⚠️ Attempt ${attempt + 1} failed: ${error.message}`);
+          
+          if (attempt === retries || error.name === 'AbortError') {
+            break;
+          }
         }
 
-        lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
-        console.warn(`⚠️ Attempt ${attempt + 1} failed: ${lastError.message}`);
-
-      } catch (error) {
-        lastError = error;
-        console.warn(`⚠️ Attempt ${attempt + 1} failed: ${error.message}`);
-        
-        if (attempt === retries || error.name === 'AbortError') {
-          break;
+        // Wait before retrying (exponential backoff)
+        if (attempt < retries) {
+          await new Promise(resolve => setTimeout(resolve, Math.min(delay, RETRY_CONFIG.maxDelay)));
+          delay *= RETRY_CONFIG.backoffMultiplier;
         }
       }
 
-      // Wait before retrying (exponential backoff)
-      if (attempt < retries) {
-        await new Promise(resolve => setTimeout(resolve, Math.min(delay, RETRY_CONFIG.maxDelay)));
-        delay *= RETRY_CONFIG.backoffMultiplier;
-      }
+      throw lastError;
+    } finally {
+      // Always clean up - remove from pending requests when done (success or failure)
+      pendingRequests.delete(requestKey);
     }
-
-    pendingRequests.delete(requestKey);
-    throw lastError;
   })();
 
   pendingRequests.set(requestKey, fetchPromise);
