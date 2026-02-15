@@ -280,8 +280,15 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
       const absoluteUrl = new URL(trimmedLine, baseUrl).href;
       
       // Determine if it's a playlist or segment
-      // .m3u8 files are playlists, everything else is a segment
-      const isPlaylist = absoluteUrl.match(/\.m3u8(\?.*)?$/i);
+      // Playlists are:
+      // - URLs ending with .m3u8
+      // - URLs with type=video, type=audio, or type=subtitle query params (variant playlists)
+      // - URLs containing /playlist/ path
+      // Everything else is treated as a TS segment
+      const isPlaylist = 
+        absoluteUrl.match(/\.m3u8(\?.*)?$/i) ||
+        absoluteUrl.match(/[?&]type=(video|audio|subtitle)(&|$)/i) ||
+        absoluteUrl.includes('/playlist/');
       const endpoint = isPlaylist ? '/m3u8-proxy' : '/ts-proxy';
       
       const proxiedUrl = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(absoluteUrl)}${headersParam}`;
@@ -338,7 +345,9 @@ app.get('/m3u8-proxy', async (req, res) => {
 
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    const proxyBaseUrl = `${req.protocol}://${req.get('host')}`;
+    // Use X-Forwarded-Proto if available (for reverse proxies), otherwise use https as default
+    const protocol = req.get('X-Forwarded-Proto') || req.protocol || 'https';
+    const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -394,7 +403,9 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
 
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    const proxyBaseUrl = `${req.protocol}://${req.get('host')}`;
+    // Use X-Forwarded-Proto if available (for reverse proxies), otherwise use https as default
+    const protocol = req.get('X-Forwarded-Proto') || req.protocol || 'https';
+    const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
