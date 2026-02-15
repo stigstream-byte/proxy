@@ -248,6 +248,26 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
       continue;
     }
 
+    // Handle #EXT-X-MEDIA tags with URI attributes (audio, subtitles)
+    if (trimmedLine.startsWith('#EXT-X-MEDIA:')) {
+      try {
+        const uriMatch = trimmedLine.match(/URI="([^"]+)"/);
+        if (uriMatch && uriMatch[1]) {
+          const mediaUrl = uriMatch[1];
+          const absoluteMediaUrl = new URL(mediaUrl, baseUrl).href;
+          const proxiedMediaUrl = `${proxyBaseUrl}/m3u8-proxy?url=${encodeURIComponent(absoluteMediaUrl)}${headersParam}`;
+          const rewrittenLine = trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedMediaUrl}"`);
+          rewrittenLines.push(rewrittenLine);
+          console.log(`Rewrote [EXT-X-MEDIA]: ${mediaUrl.substring(0, 60)}...`);
+          continue;
+        }
+      } catch (error) {
+        console.warn('Failed to rewrite EXT-X-MEDIA:', trimmedLine, error.message);
+      }
+      rewrittenLines.push(line);
+      continue;
+    }
+
     // Skip other comment lines (tags starting with #)
     if (trimmedLine.startsWith('#')) {
       rewrittenLines.push(line);
