@@ -222,8 +222,34 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
   for (const line of lines) {
     const trimmedLine = line.trim();
     
-    // Skip empty lines and comments (lines starting with #)
-    if (trimmedLine === '' || trimmedLine.startsWith('#')) {
+    // Skip empty lines
+    if (trimmedLine === '') {
+      rewrittenLines.push(line);
+      continue;
+    }
+
+    // Handle #EXT-X-KEY tags with URI attributes
+    if (trimmedLine.startsWith('#EXT-X-KEY:')) {
+      try {
+        const uriMatch = trimmedLine.match(/URI="([^"]+)"/);
+        if (uriMatch && uriMatch[1]) {
+          const keyUrl = uriMatch[1];
+          const absoluteKeyUrl = new URL(keyUrl, baseUrl).href;
+          const proxiedKeyUrl = `${proxyBaseUrl}/fetch?url=${encodeURIComponent(absoluteKeyUrl)}${headersParam}`;
+          const rewrittenLine = trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedKeyUrl}"`);
+          rewrittenLines.push(rewrittenLine);
+          console.log(`Rewrote [EXT-X-KEY]: ${keyUrl.substring(0, 60)}...`);
+          continue;
+        }
+      } catch (error) {
+        console.warn('Failed to rewrite EXT-X-KEY:', trimmedLine, error.message);
+      }
+      rewrittenLines.push(line);
+      continue;
+    }
+
+    // Skip other comment lines (tags starting with #)
+    if (trimmedLine.startsWith('#')) {
       rewrittenLines.push(line);
       continue;
     }
