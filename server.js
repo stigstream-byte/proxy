@@ -271,6 +271,26 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
       continue;
     }
 
+    // Handle #EXT-X-MAP tags with URI attributes (initialization segments)
+    if (trimmedLine.startsWith('#EXT-X-MAP:')) {
+      try {
+        const uriMatch = trimmedLine.match(/URI="([^"]+)"/);
+        if (uriMatch && uriMatch[1]) {
+          const mapUrl = uriMatch[1];
+          const absoluteMapUrl = new URL(mapUrl, baseUrl).href;
+          const proxiedMapUrl = `${proxyBaseUrl}/ts-proxy?url=${encodeURIComponent(absoluteMapUrl)}${headersParam}`;
+          const rewrittenLine = trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedMapUrl}"`);
+          rewrittenLines.push(rewrittenLine);
+          console.log(`Rewrote [EXT-X-MAP]: ${mapUrl.substring(0, 60)}...`);
+          continue;
+        }
+      } catch (error) {
+        console.warn('Failed to rewrite EXT-X-MAP:', trimmedLine, error.message);
+      }
+      rewrittenLines.push(line);
+      continue;
+    }
+
     // Skip other comment lines (tags starting with #)
     if (trimmedLine.startsWith('#')) {
       rewrittenLines.push(line);
