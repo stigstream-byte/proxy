@@ -10,6 +10,9 @@ const AbortController = require('abort-controller');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Trust reverse proxy headers (e.g. X-Forwarded-Proto from nginx/Cloudflare)
+app.set('trust proxy', true);
+
 // Retry configuration for robust fetching - optimized for speed
 const RETRY_CONFIG = {
   maxRetries: 2,
@@ -345,8 +348,8 @@ app.get('/m3u8-proxy', async (req, res) => {
 
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    // Use X-Forwarded-Proto if available (for reverse proxies), otherwise use https as default
-    const protocol = req.get('X-Forwarded-Proto') || req.protocol || 'https';
+    // req.protocol is reliable now that trust proxy is enabled; fallback to https for safety
+    const protocol = req.protocol || 'https';
     const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
@@ -403,8 +406,8 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
 
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    // Use X-Forwarded-Proto if available (for reverse proxies), otherwise use https as default
-    const protocol = req.get('X-Forwarded-Proto') || req.protocol || 'https';
+    // req.protocol is reliable now that trust proxy is enabled; fallback to https for safety
+    const protocol = req.protocol || 'https';
     const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
