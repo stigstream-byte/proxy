@@ -349,7 +349,8 @@ app.get('/m3u8-proxy', async (req, res) => {
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     // req.protocol is reliable now that trust proxy is enabled; fallback to https for safety
-    const protocol = req.protocol || 'https';
+    //const protocol = req.protocol || 'https';
+    const protocol = 'https'; // Force https for proxy URLs to avoid mixed content issues in browsers
     const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
@@ -407,7 +408,8 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
     // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     // req.protocol is reliable now that trust proxy is enabled; fallback to https for safety
-    const protocol = req.protocol || 'https';
+    //const protocol = req.protocol || 'https';
+    const protocol = 'https'; // Force https for proxy URLs to avoid mixed content issues in browsers
     const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
