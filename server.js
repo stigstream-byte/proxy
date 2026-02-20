@@ -6,6 +6,8 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const AbortController = require('abort-controller');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,7 +15,11 @@ const PORT = process.env.PORT || 3000;
 // Trust reverse proxy headers (e.g. X-Forwarded-Proto from nginx/Cloudflare)
 app.set('trust proxy', true);
 
-// Retry configuration for robust fetching - optimized for speed
+// Keep-alive agents for connection reuse — dramatically reduces latency for repeated upstream requests
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
+
+// Retry configuration
 const RETRY_CONFIG = {
   maxRetries: 2,
   initialDelay: 25,
@@ -21,14 +27,29 @@ const RETRY_CONFIG = {
   backoffMultiplier: 2
 };
 
-const TIMEOUT_MS = 15000; // 15 second timeout for M3U8
+const TIMEOUT_MS = 15000;        // 15 second timeout for M3U8
 const SEGMENT_TIMEOUT_MS = 10000; // 10 second timeout for segments
 
-// Request deduplication map
+/**
+ * Pending request deduplication map.
+ * ONLY used for non-streaming/buffered requests (M3U8 text).
+ * Never use for ts-proxy / streaming responses — sharing a stream body between
+ * two callers causes the second caller to receive an empty response.
+ */
 const pendingRequests = new Map();
 
-// More realistic User-Agent (matches common browsers)
+// More realistic User-Agent
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// Headers that must never be forwarded downstream (they conflict with Express/pipe)
+const BLOCKED_RESPONSE_HEADERS = new Set([
+  'content-type',
+  'access-control-allow-origin',
+  'access-control-allow-headers',
+  'access-control-allow-methods',
+  'x-upstream-status',
+  'transfer-encoding', // ← IMPORTANT: forwarding this while piping causes corruption
+]);
 
 // Middleware for CORS
 app.use((req, res, next) => {
@@ -38,7 +59,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Date, Server, X-Cache-Hit');
   res.header('Access-Control-Max-Age', '86400');
   res.header('Timing-Allow-Origin', '*');
-  
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -49,68 +70,87 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 /**
- * Retry wrapper with exponential backoff, timeout protection, and request deduplication
+ * Retry wrapper with exponential backoff and timeout protection.
+ * Supports optional request deduplication (for buffered/text responses only).
  */
-async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, timeoutMs = TIMEOUT_MS) {
-  const requestKey = `${url}:${JSON.stringify(options?.headers || {})}`;
-  if (pendingRequests.has(requestKey)) {
+async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, timeoutMs = TIMEOUT_MS, deduplicate = false) {
+  // Deduplication: only safe for non-streaming (buffered) requests
+  if (deduplicate) {
+    const requestKey = `${url}:${JSON.stringify(options?.headers || {})}`;
+    if (pendingRequests.has(requestKey)) {
+      try {
+        return await pendingRequests.get(requestKey);
+      } catch {
+        // pending request failed, fall through to retry
+      }
+    }
+
+    // Set the promise synchronously before the async work begins
+    let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    pendingRequests.set(requestKey, promise);
+
     try {
-      return await pendingRequests.get(requestKey);
-    } catch (error) {
-      // If the pending request failed, continue to try again
+      const result = await _fetchWithRetryCore(url, options, retries, timeoutMs);
+      resolve(result);
+      return result;
+    } catch (err) {
+      reject(err);
+      throw err;
+    } finally {
+      pendingRequests.delete(requestKey);
     }
   }
 
+  return _fetchWithRetryCore(url, options, retries, timeoutMs);
+}
+
+async function _fetchWithRetryCore(url, options, retries, timeoutMs) {
   let lastError;
   let delay = RETRY_CONFIG.initialDelay;
 
-  const fetchPromise = (async () => {
+  // Pick the right keep-alive agent based on protocol
+  const agent = url.startsWith('https') ? httpsAgent : httpAgent;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
-      for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const response = await fetch(url, {
+        ...options,
+        agent,
+        signal: controller.signal
+      });
 
-          const response = await fetch(url, {
-            ...options,
-            signal: controller.signal
-          });
+      clearTimeout(timeoutId);
 
-          clearTimeout(timeoutId);
-
-          // Only retry on specific status codes (5xx and 429)
-          if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
-            return response;
-          }
-
-          lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
-          console.warn(`⚠️ Attempt ${attempt + 1} failed: ${lastError.message}`);
-
-        } catch (error) {
-          lastError = error;
-          console.warn(`⚠️ Attempt ${attempt + 1} failed: ${error.message}`);
-          
-          if (attempt === retries || error.name === 'AbortError') {
-            break;
-          }
-        }
-
-        // Wait before retrying (exponential backoff)
-        if (attempt < retries) {
-          await new Promise(resolve => setTimeout(resolve, Math.min(delay, RETRY_CONFIG.maxDelay)));
-          delay *= RETRY_CONFIG.backoffMultiplier;
-        }
+      // Only retry on 5xx and 429; return everything else as-is
+      if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
+        return response;
       }
 
-      throw lastError;
-    } finally {
-      // Always clean up - remove from pending requests when done (success or failure)
-      pendingRequests.delete(requestKey);
-    }
-  })();
+      lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+      console.warn(`⚠️ Attempt ${attempt + 1} failed: ${lastError.message}`);
 
-  pendingRequests.set(requestKey, fetchPromise);
-  return fetchPromise;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      lastError = error;
+      console.warn(`⚠️ Attempt ${attempt + 1} failed: ${error.message}`);
+
+      // Don't retry timeouts or hard abort errors
+      if (attempt === retries || error.name === 'AbortError') {
+        break;
+      }
+    }
+
+    if (attempt < retries) {
+      await new Promise(resolve => setTimeout(resolve, Math.min(delay, RETRY_CONFIG.maxDelay)));
+      delay *= RETRY_CONFIG.backoffMultiplier;
+    }
+  }
+
+  throw lastError;
 }
 
 /**
@@ -119,7 +159,7 @@ async function fetchWithRetry(url, options, retries = RETRY_CONFIG.maxRetries, t
 function validateUrl(urlString) {
   try {
     const url = new URL(urlString);
-    
+
     if (!['http:', 'https:'].includes(url.protocol)) {
       return { valid: false, error: 'Only HTTP/HTTPS protocols allowed' };
     }
@@ -138,17 +178,17 @@ function validateUrl(urlString) {
     }
 
     return { valid: true };
-  } catch (error) {
+  } catch {
     return { valid: false, error: 'Invalid URL format' };
   }
 }
 
 /**
- * Parse custom headers from query parameters with proper error handling
+ * Parse custom headers from query parameters
  */
 function parseCustomHeaders(query) {
   const customHeaders = {};
-  
+
   const headersParam = query.headers;
   if (headersParam) {
     try {
@@ -156,12 +196,9 @@ function parseCustomHeaders(query) {
       try {
         headersObj = JSON.parse(headersParam);
       } catch {
-        // Try base64 decode
         const decoded = Buffer.from(headersParam, 'base64').toString('utf-8');
         headersObj = JSON.parse(decoded);
       }
-      
-      // Properly merge headers (case-sensitive)
       Object.assign(customHeaders, headersObj);
       console.log('✓ Parsed custom headers:', Object.keys(headersObj));
     } catch (error) {
@@ -169,7 +206,6 @@ function parseCustomHeaders(query) {
     }
   }
 
-  // Parse individual header_* parameters
   for (const [key, value] of Object.entries(query)) {
     if (key.startsWith('header_')) {
       const headerName = key.replace('header_', '').replace(/_/g, '-');
@@ -188,7 +224,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
     'User-Agent': customHeaders['User-Agent'] || customHeaders['user-agent'] || DEFAULT_USER_AGENT,
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'identity', // Explicitly disable compression to avoid decoding issues when proxying
+    'Accept-Encoding': 'identity', // Disable compression to avoid decoding issues when proxying
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Connection': 'keep-alive',
@@ -200,15 +236,48 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
     'sec-ch-ua-platform': '"Windows"'
   };
 
-  // Merge custom headers
   for (const [key, value] of Object.entries(customHeaders)) {
-    if (key.toLowerCase() === 'referer' && !includeReferer) {
-      continue;
-    }
+    if (key.toLowerCase() === 'referer' && !includeReferer) continue;
     headers[key] = value;
   }
 
   return headers;
+}
+
+/**
+ * Forward upstream response headers to the client, skipping blocked ones.
+ */
+function forwardResponseHeaders(upstreamResponse, res) {
+  for (const [key, value] of upstreamResponse.headers.entries()) {
+    if (!BLOCKED_RESPONSE_HEADERS.has(key.toLowerCase())) {
+      res.setHeader(key, value);
+    }
+  }
+}
+
+/**
+ * Pipe an upstream response stream to the Express response,
+ * with proper client-disconnect handling to abort the upstream request.
+ */
+function streamResponse(upstreamResponse, res, abortController) {
+  const body = upstreamResponse.body;
+
+  // If the client disconnects, abort the upstream fetch immediately
+  res.on('close', () => {
+    if (abortController) abortController.abort();
+    body.destroy();
+  });
+
+  body.on('error', (err) => {
+    console.error('❌ Upstream stream error:', err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Stream error', message: err.message });
+    } else {
+      res.destroy();
+    }
+  });
+
+  body.pipe(res);
 }
 
 /**
@@ -217,21 +286,19 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
 function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}) {
   const lines = m3u8Content.split('\n');
   const rewrittenLines = [];
-  
-  const headersParam = Object.keys(customHeaders).length > 0 
+
+  const headersParam = Object.keys(customHeaders).length > 0
     ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
     : '';
 
   for (const line of lines) {
     const trimmedLine = line.trim();
-    
-    // Skip empty lines
+
     if (trimmedLine === '') {
       rewrittenLines.push(line);
       continue;
     }
 
-    // Handle #EXT-X-KEY tags with URI attributes
     if (trimmedLine.startsWith('#EXT-X-KEY:')) {
       try {
         const uriMatch = trimmedLine.match(/URI="([^"]+)"/);
@@ -239,19 +306,16 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
           const keyUrl = uriMatch[1];
           const absoluteKeyUrl = new URL(keyUrl, baseUrl).href;
           const proxiedKeyUrl = `${proxyBaseUrl}/fetch?url=${encodeURIComponent(absoluteKeyUrl)}${headersParam}`;
-          const rewrittenLine = trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedKeyUrl}"`);
-          rewrittenLines.push(rewrittenLine);
-          console.log(`Rewrote [EXT-X-KEY]: ${keyUrl.substring(0, 60)}...`);
+          rewrittenLines.push(trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedKeyUrl}"`));
           continue;
         }
       } catch (error) {
-        console.warn('Failed to rewrite EXT-X-KEY:', trimmedLine, error.message);
+        console.warn('Failed to rewrite EXT-X-KEY:', error.message);
       }
       rewrittenLines.push(line);
       continue;
     }
 
-    // Handle #EXT-X-MEDIA tags with URI attributes (audio, subtitles)
     if (trimmedLine.startsWith('#EXT-X-MEDIA:')) {
       try {
         const uriMatch = trimmedLine.match(/URI="([^"]+)"/);
@@ -259,19 +323,16 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
           const mediaUrl = uriMatch[1];
           const absoluteMediaUrl = new URL(mediaUrl, baseUrl).href;
           const proxiedMediaUrl = `${proxyBaseUrl}/m3u8-proxy?url=${encodeURIComponent(absoluteMediaUrl)}${headersParam}`;
-          const rewrittenLine = trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedMediaUrl}"`);
-          rewrittenLines.push(rewrittenLine);
-          console.log(`Rewrote [EXT-X-MEDIA]: ${mediaUrl.substring(0, 60)}...`);
+          rewrittenLines.push(trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedMediaUrl}"`));
           continue;
         }
       } catch (error) {
-        console.warn('Failed to rewrite EXT-X-MEDIA:', trimmedLine, error.message);
+        console.warn('Failed to rewrite EXT-X-MEDIA:', error.message);
       }
       rewrittenLines.push(line);
       continue;
     }
 
-    // Handle #EXT-X-MAP tags with URI attributes (initialization segments)
     if (trimmedLine.startsWith('#EXT-X-MAP:')) {
       try {
         const uriMatch = trimmedLine.match(/URI="([^"]+)"/);
@@ -279,45 +340,29 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
           const mapUrl = uriMatch[1];
           const absoluteMapUrl = new URL(mapUrl, baseUrl).href;
           const proxiedMapUrl = `${proxyBaseUrl}/ts-proxy?url=${encodeURIComponent(absoluteMapUrl)}${headersParam}`;
-          const rewrittenLine = trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedMapUrl}"`);
-          rewrittenLines.push(rewrittenLine);
-          console.log(`Rewrote [EXT-X-MAP]: ${mapUrl.substring(0, 60)}...`);
+          rewrittenLines.push(trimmedLine.replace(/URI="[^"]+"/, `URI="${proxiedMapUrl}"`));
           continue;
         }
       } catch (error) {
-        console.warn('Failed to rewrite EXT-X-MAP:', trimmedLine, error.message);
+        console.warn('Failed to rewrite EXT-X-MAP:', error.message);
       }
       rewrittenLines.push(line);
       continue;
     }
 
-    // Skip other comment lines (tags starting with #)
     if (trimmedLine.startsWith('#')) {
       rewrittenLines.push(line);
       continue;
     }
 
     try {
-      // Any non-comment line in M3U8 should be a URL
-      // Convert to absolute URL
       const absoluteUrl = new URL(trimmedLine, baseUrl).href;
-      
-      // Determine if it's a playlist or segment
-      // Playlists are:
-      // - URLs ending with .m3u8
-      // - URLs with type=video, type=audio, or type=subtitle query params (variant playlists)
-      // - URLs containing /playlist/ path
-      // Everything else is treated as a TS segment
-      const isPlaylist = 
+      const isPlaylist =
         absoluteUrl.match(/\.m3u8(\?.*)?$/i) ||
         absoluteUrl.match(/[?&]type=(video|audio|subtitle)(&|$)/i) ||
         absoluteUrl.includes('/playlist/');
       const endpoint = isPlaylist ? '/m3u8-proxy' : '/ts-proxy';
-      
-      const proxiedUrl = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(absoluteUrl)}${headersParam}`;
-      rewrittenLines.push(proxiedUrl);
-      
-      console.log(`Rewrote [${endpoint}]: ${trimmedLine.substring(0, 60)}...`);
+      rewrittenLines.push(`${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(absoluteUrl)}${headersParam}`);
     } catch (error) {
       console.warn('Failed to rewrite line:', trimmedLine, error.message);
       rewrittenLines.push(line);
@@ -335,15 +380,11 @@ app.get('/health', (req, res) => {
 // M3U8 proxy endpoint
 app.get('/m3u8-proxy', async (req, res) => {
   const targetUrl = req.query.url;
-  
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
+
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const urlValidation = validateUrl(targetUrl);
-  if (!urlValidation.valid) {
-    return res.status(400).json({ error: urlValidation.error });
-  }
+  if (!urlValidation.valid) return res.status(400).json({ error: urlValidation.error });
 
   console.log('📺 M3U8 Request:', targetUrl);
 
@@ -351,26 +392,19 @@ app.get('/m3u8-proxy', async (req, res) => {
     const customHeaders = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
-    const targetResponse = await fetchWithRetry(targetUrl, {
-      headers: requestHeaders
-    });
+    // M3U8 responses are small text — deduplication is safe here (no stream sharing)
+    const targetResponse = await fetchWithRetry(targetUrl, { headers: requestHeaders }, RETRY_CONFIG.maxRetries, TIMEOUT_MS, true);
 
     if (!targetResponse.ok) {
       console.error('❌ M3U8 fetch failed:', targetResponse.status);
-      return res.status(targetResponse.status).json({
-        error: 'Failed to fetch M3U8',
-        status: targetResponse.status
-      });
+      return res.status(targetResponse.status).json({ error: 'Failed to fetch M3U8', status: targetResponse.status });
     }
 
     let m3u8Content = await targetResponse.text();
     console.log('✅ M3U8 fetched, size:', m3u8Content.length);
 
-    // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    // req.protocol is reliable now that trust proxy is enabled; fallback to https for safety
-    //const protocol = req.protocol || 'https';
-    const protocol = 'https'; // Force https for proxy URLs to avoid mixed content issues in browsers
+    const protocol = 'https';
     const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
@@ -380,26 +414,18 @@ app.get('/m3u8-proxy', async (req, res) => {
 
   } catch (error) {
     console.error('❌ M3U8 proxy error:', error);
-    res.status(502).json({
-      error: 'Proxy error',
-      message: error.message,
-      type: error.name
-    });
+    res.status(502).json({ error: 'Proxy error', message: error.message, type: error.name });
   }
 });
 
 // M3U8 proxy endpoint (no referer)
 app.get('/m3u8-proxy-no-referer', async (req, res) => {
   const targetUrl = req.query.url;
-  
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
+
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const urlValidation = validateUrl(targetUrl);
-  if (!urlValidation.valid) {
-    return res.status(400).json({ error: urlValidation.error });
-  }
+  if (!urlValidation.valid) return res.status(400).json({ error: urlValidation.error });
 
   console.log('📺 M3U8 Request (No Referer):', targetUrl);
 
@@ -410,26 +436,18 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
 
     const requestHeaders = buildRequestHeaders(customHeaders, false);
 
-    const targetResponse = await fetchWithRetry(targetUrl, {
-      headers: requestHeaders
-    });
+    const targetResponse = await fetchWithRetry(targetUrl, { headers: requestHeaders }, RETRY_CONFIG.maxRetries, TIMEOUT_MS, true);
 
     if (!targetResponse.ok) {
       console.error('❌ M3U8 fetch failed:', targetResponse.status);
-      return res.status(targetResponse.status).json({
-        error: 'Failed to fetch M3U8',
-        status: targetResponse.status
-      });
+      return res.status(targetResponse.status).json({ error: 'Failed to fetch M3U8', status: targetResponse.status });
     }
 
     let m3u8Content = await targetResponse.text();
     console.log('✅ M3U8 fetched (No Referer), size:', m3u8Content.length);
 
-    // Rewrite M3U8 content
     const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    // req.protocol is reliable now that trust proxy is enabled; fallback to https for safety
-    //const protocol = req.protocol || 'https';
-    const protocol = 'https'; // Force https for proxy URLs to avoid mixed content issues in browsers
+    const protocol = 'https';
     const proxyBaseUrl = `${protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders);
 
@@ -439,242 +457,205 @@ app.get('/m3u8-proxy-no-referer', async (req, res) => {
 
   } catch (error) {
     console.error('❌ M3U8 proxy error (No Referer):', error);
-    res.status(502).json({
-      error: 'Proxy error',
-      message: error.message,
-      type: error.name
-    });
+    res.status(502).json({ error: 'Proxy error', message: error.message, type: error.name });
   }
 });
 
 // TS/Segment proxy endpoint
 app.get('/ts-proxy', async (req, res) => {
   const targetUrl = req.query.url;
-  
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
+
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const urlValidation = validateUrl(targetUrl);
-  if (!urlValidation.valid) {
-    return res.status(400).json({ error: urlValidation.error });
-  }
+  if (!urlValidation.valid) return res.status(400).json({ error: urlValidation.error });
+
+  // Create a dedicated AbortController so we can cancel the upstream fetch
+  // if the client disconnects mid-stream
+  const controller = new AbortController();
 
   try {
     const customHeaders = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
-    // Forward Range header if present
     const rangeHeader = req.get('Range');
-    if (rangeHeader) {
-      requestHeaders['Range'] = rangeHeader;
+    if (rangeHeader) requestHeaders['Range'] = rangeHeader;
+
+    // NOTE: deduplication is intentionally disabled for ts-proxy.
+    // TS segments are streamed — sharing the same Response object between two callers
+    // means the second caller gets an already-consumed (empty) stream body.
+    const agent = targetUrl.startsWith('https') ? httpsAgent : httpAgent;
+
+    let lastError;
+    let delay = RETRY_CONFIG.initialDelay;
+    let targetResponse;
+
+    for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+      const timeoutId = setTimeout(() => controller.abort(), SEGMENT_TIMEOUT_MS);
+      try {
+        targetResponse = await fetch(targetUrl, {
+          headers: requestHeaders,
+          agent,
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (targetResponse.ok || (targetResponse.status >= 400 && targetResponse.status < 500 && targetResponse.status !== 429)) {
+          break;
+        }
+
+        lastError = new Error(`HTTP ${targetResponse.status}: ${targetResponse.statusText}`);
+        console.warn(`⚠️ TS attempt ${attempt + 1} failed: ${lastError.message}`);
+        targetResponse = null;
+
+      } catch (error) {
+        clearTimeout(timeoutId);
+        lastError = error;
+        console.warn(`⚠️ TS attempt ${attempt + 1} failed: ${error.message}`);
+        if (attempt === RETRY_CONFIG.maxRetries || error.name === 'AbortError') break;
+      }
+
+      if (attempt < RETRY_CONFIG.maxRetries) {
+        await new Promise(r => setTimeout(r, Math.min(delay, RETRY_CONFIG.maxDelay)));
+        delay *= RETRY_CONFIG.backoffMultiplier;
+      }
     }
 
-    const targetResponse = await fetchWithRetry(targetUrl, {
-      headers: requestHeaders
-    }, RETRY_CONFIG.maxRetries, SEGMENT_TIMEOUT_MS);
+    if (!targetResponse) throw lastError;
 
     if (!targetResponse.ok) {
       console.error('❌ Segment fetch failed:', targetResponse.status);
-      return res.status(targetResponse.status).json({
-        error: 'Failed to fetch segment',
-        status: targetResponse.status
-      });
+      return res.status(targetResponse.status).json({ error: 'Failed to fetch segment', status: targetResponse.status });
     }
 
     const contentType = targetResponse.headers.get('content-type') || 'video/MP2T';
+    const contentLength = targetResponse.headers.get('content-length');
 
-    // Set response headers
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
 
-    // Forward other headers
-    for (const [key, value] of targetResponse.headers.entries()) {
-      const lowerKey = key.toLowerCase();
-      if (
-        lowerKey !== 'content-type' &&
-        lowerKey !== 'access-control-allow-origin' &&
-        lowerKey !== 'access-control-allow-headers' &&
-        lowerKey !== 'access-control-allow-methods' &&
-        lowerKey !== 'x-upstream-status'
-      ) {
-        res.setHeader(key, value);
-      }
-    }
+    // Forward content-length so the player knows the segment size upfront
+    if (contentLength) res.setHeader('Content-Length', contentLength);
 
-    // Stream the response
-    targetResponse.body.pipe(res);
+    forwardResponseHeaders(targetResponse, res);
+
+    streamResponse(targetResponse, res, controller);
 
   } catch (error) {
     console.error('❌ Segment proxy error:', error);
-    res.status(502).json({
-      error: 'Proxy error',
-      message: error.message,
-      type: error.name
-    });
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Proxy error', message: error.message, type: error.name });
+    }
   }
 });
 
 // MP4 proxy endpoint
 app.get('/mp4-proxy', async (req, res) => {
   const targetUrl = req.query.url;
-  
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
+
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const urlValidation = validateUrl(targetUrl);
-  if (!urlValidation.valid) {
-    return res.status(400).json({ error: urlValidation.error });
-  }
+  if (!urlValidation.valid) return res.status(400).json({ error: urlValidation.error });
 
   console.log('🎬 MP4 Request:', targetUrl);
+
+  const controller = new AbortController();
 
   try {
     const customHeaders = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
-    // Forward Range header if present
     const rangeHeader = req.get('Range');
-    if (rangeHeader) {
-      requestHeaders['Range'] = rangeHeader;
-    }
+    if (rangeHeader) requestHeaders['Range'] = rangeHeader;
 
-    const targetResponse = await fetchWithRetry(targetUrl, {
-      headers: requestHeaders
-    });
+    const targetResponse = await fetchWithRetry(targetUrl, { headers: requestHeaders, signal: controller.signal });
 
     if (!targetResponse.ok) {
       console.error('❌ MP4 fetch failed:', targetResponse.status);
-      return res.status(targetResponse.status).json({
-        error: 'Failed to fetch MP4',
-        status: targetResponse.status
-      });
+      return res.status(targetResponse.status).json({ error: 'Failed to fetch MP4', status: targetResponse.status });
     }
 
     const contentType = targetResponse.headers.get('content-type') || 'video/mp4';
+    const contentLength = targetResponse.headers.get('content-length');
     console.log('✅ MP4 fetched:', contentType);
 
-    // Set response headers
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
 
-    // Forward other headers
-    for (const [key, value] of targetResponse.headers.entries()) {
-      const lowerKey = key.toLowerCase();
-      if (
-        lowerKey !== 'content-type' &&
-        lowerKey !== 'access-control-allow-origin' &&
-        lowerKey !== 'access-control-allow-headers' &&
-        lowerKey !== 'access-control-allow-methods' &&
-        lowerKey !== 'x-upstream-status'
-      ) {
-        res.setHeader(key, value);
-      }
-    }
-
-    // Stream the response
-    targetResponse.body.pipe(res);
+    forwardResponseHeaders(targetResponse, res);
+    streamResponse(targetResponse, res, controller);
 
   } catch (error) {
     console.error('❌ MP4 proxy error:', error);
-    res.status(502).json({
-      error: 'Proxy error',
-      message: error.message,
-      type: error.name
-    });
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Proxy error', message: error.message, type: error.name });
+    }
   }
 });
 
 // Generic fetch endpoint
 app.get('/fetch', async (req, res) => {
   const targetUrl = req.query.url;
-  
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
+
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const urlValidation = validateUrl(targetUrl);
-  if (!urlValidation.valid) {
-    return res.status(400).json({ error: urlValidation.error });
-  }
+  if (!urlValidation.valid) return res.status(400).json({ error: urlValidation.error });
 
   console.log('🌐 Fetch Request:', targetUrl);
+
+  const controller = new AbortController();
 
   try {
     const customHeaders = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
-    // Forward Range header if present
     const rangeHeader = req.get('Range');
-    if (rangeHeader) {
-      requestHeaders['Range'] = rangeHeader;
-    }
+    if (rangeHeader) requestHeaders['Range'] = rangeHeader;
 
-    const targetResponse = await fetchWithRetry(targetUrl, {
-      method: req.method,
-      headers: requestHeaders
-    });
+    const targetResponse = await fetchWithRetry(targetUrl, { method: req.method, headers: requestHeaders });
 
     if (!targetResponse.ok) {
       console.error('❌ Fetch failed:', targetResponse.status);
-      return res.status(targetResponse.status).json({
-        error: 'Failed to fetch resource',
-        status: targetResponse.status
-      });
+      return res.status(targetResponse.status).json({ error: 'Failed to fetch resource', status: targetResponse.status });
     }
 
     const contentType = targetResponse.headers.get('content-type') || 'application/octet-stream';
+    const contentLength = targetResponse.headers.get('content-length');
     console.log('✅ Fetched:', contentType);
 
-    // Set response headers
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
 
-    // Forward other headers
-    for (const [key, value] of targetResponse.headers.entries()) {
-      const lowerKey = key.toLowerCase();
-      if (
-        lowerKey !== 'content-type' &&
-        lowerKey !== 'access-control-allow-origin' &&
-        lowerKey !== 'access-control-allow-headers' &&
-        lowerKey !== 'access-control-allow-methods' &&
-        lowerKey !== 'x-upstream-status'
-      ) {
-        res.setHeader(key, value);
-      }
-    }
-
-    // Stream the response
-    targetResponse.body.pipe(res);
+    forwardResponseHeaders(targetResponse, res);
+    streamResponse(targetResponse, res, controller);
 
   } catch (error) {
     console.error('❌ Fetch proxy error:', error);
-    res.status(502).json({
-      error: 'Proxy error',
-      message: error.message,
-      type: error.name
-    });
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Proxy error', message: error.message, type: error.name });
+    }
   }
 });
 
 // Generic fetch endpoint (no referer)
 app.get('/fetch-no-referer', async (req, res) => {
   const targetUrl = req.query.url;
-  
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
+
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const urlValidation = validateUrl(targetUrl);
-  if (!urlValidation.valid) {
-    return res.status(400).json({ error: urlValidation.error });
-  }
+  if (!urlValidation.valid) return res.status(400).json({ error: urlValidation.error });
 
   console.log('🌐 Fetch Request (No Referer)');
+
+  const controller = new AbortController();
 
   try {
     let customHeaders = parseCustomHeaders(req.query);
@@ -683,109 +664,76 @@ app.get('/fetch-no-referer', async (req, res) => {
 
     const requestHeaders = buildRequestHeaders(customHeaders, false);
 
-    // Forward Range header if present
     const rangeHeader = req.get('Range');
-    if (rangeHeader) {
-      requestHeaders['Range'] = rangeHeader;
-    }
+    if (rangeHeader) requestHeaders['Range'] = rangeHeader;
 
-    const targetResponse = await fetchWithRetry(targetUrl, {
-      method: req.method,
-      headers: requestHeaders
-    });
+    const targetResponse = await fetchWithRetry(targetUrl, { method: req.method, headers: requestHeaders });
 
     if (!targetResponse.ok) {
       console.error('❌ Fetch failed:', targetResponse.status);
-      return res.status(targetResponse.status).json({
-        error: 'Failed to fetch resource',
-        status: targetResponse.status
-      });
+      return res.status(targetResponse.status).json({ error: 'Failed to fetch resource', status: targetResponse.status });
     }
 
     const contentType = targetResponse.headers.get('content-type') || 'application/octet-stream';
+    const contentLength = targetResponse.headers.get('content-length');
     console.log('✅ Fetched (No Referer):', contentType);
 
-    // Set response headers
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
 
-    // Forward other headers
-    for (const [key, value] of targetResponse.headers.entries()) {
-      const lowerKey = key.toLowerCase();
-      if (
-        lowerKey !== 'content-type' &&
-        lowerKey !== 'access-control-allow-origin' &&
-        lowerKey !== 'access-control-allow-headers' &&
-        lowerKey !== 'access-control-allow-methods' &&
-        lowerKey !== 'x-upstream-status'
-      ) {
-        res.setHeader(key, value);
-      }
-    }
-
-    // Stream the response
-    targetResponse.body.pipe(res);
+    forwardResponseHeaders(targetResponse, res);
+    streamResponse(targetResponse, res, controller);
 
   } catch (error) {
     console.error('❌ Fetch proxy error (No Referer):', error);
-    res.status(502).json({
-      error: 'Proxy error',
-      message: error.message,
-      type: error.name
-    });
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Proxy error', message: error.message, type: error.name });
+    }
   }
 });
 
 // Subtitle proxy endpoint
 app.get('/subtitle', async (req, res) => {
   const targetUrl = req.query.url;
-  
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing url parameter' });
-  }
+
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const urlValidation = validateUrl(targetUrl);
-  if (!urlValidation.valid) {
-    return res.status(400).json({ error: urlValidation.error });
-  }
+  if (!urlValidation.valid) return res.status(400).json({ error: urlValidation.error });
 
   try {
     const customHeaders = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
-    const response = await fetchWithRetry(targetUrl, {
-      headers: requestHeaders
-    }, 1, 15000);
+    const response = await fetchWithRetry(targetUrl, { headers: requestHeaders }, 1, 15000);
 
     if (!response.ok) {
       return res.status(502).json({ error: 'Failed to fetch subtitle', status: response.status });
     }
 
     const buffer = await response.buffer();
-    
-    // Try to decode as UTF-8, fallback to ISO-8859-1 if it looks wrong
+
     let text = '';
     try {
       text = buffer.toString('utf-8');
-      if ((text.match(/�/g) || []).length > 10) {
+      if ((text.match(/\uFFFD/g) || []).length > 10) {
         text = buffer.toString('latin1');
       }
-    } catch (e) {
+    } catch {
       text = buffer.toString('latin1');
     }
 
-    // Try to parse as SRT or VTT
-    let entries = parseSRTorVTT(text);
+    const entries = parseSRTorVTT(text);
     if (!entries || entries.length === 0) {
       return res.status(415).json({ error: 'Unsupported subtitle format or failed to parse.' });
     }
 
-    // Convert to SRT
     const srt = entriesToSRT(entries);
-    
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.send(srt);
+
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch or convert subtitle', message: err.message });
   }
@@ -837,10 +785,7 @@ app.use((req, res) => {
 // Error handler
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
-  res.status(500).json({
-    error: 'Internal Server Error',
-    message: err.message
-  });
+  res.status(500).json({ error: 'Internal Server Error', message: err.message });
 });
 
 // Start server
