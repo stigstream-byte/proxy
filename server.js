@@ -407,10 +407,14 @@ function streamResponse(upstreamResponse, res, abortController) {
 // M3U8 rewriter
 // ---------------------------------------------------------------------------
 
-function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}) {
+function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}, hostOverride = '') {
   const headersParam = Object.keys(customHeaders).length > 0
     ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
     : '';
+
+  // Propagate the host= param so every child request (segments, sub-playlists,
+  // keys, init segments) also sends the correct Host header upstream.
+  const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
 
   return m3u8Content.split('\n').map(line => {
     const t = line.trim();
@@ -422,10 +426,10 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
         if (match) {
           const abs = new URL(match[1], baseUrl).href;
           let endpoint;
-          if (t.startsWith('#EXT-X-KEY:'))   endpoint = '/fetch';
+          if (t.startsWith('#EXT-X-KEY:'))    endpoint = '/fetch';
           else if (t.startsWith('#EXT-X-MAP:')) endpoint = '/ts-proxy';
-          else                                 endpoint = '/m3u8-proxy';
-          const proxied = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(abs)}${headersParam}`;
+          else                                  endpoint = '/m3u8-proxy';
+          const proxied = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(abs)}${headersParam}${hostParam}`;
           return t.replace(/URI="[^"]+"/, `URI="${proxied}"`);
         }
       } catch (err) {
@@ -443,7 +447,7 @@ function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = 
         /[?&]type=(video|audio|subtitle)(&|$)/i.test(abs) ||
         abs.includes('/playlist/');
       const endpoint = isPlaylist ? '/m3u8-proxy' : '/ts-proxy';
-      return `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(abs)}${headersParam}`;
+      return `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(abs)}${headersParam}${hostParam}`;
     } catch (err) {
       console.warn('Failed to rewrite line:', t, err.message);
       return line;
@@ -462,13 +466,23 @@ async function handleM3U8(req, res, includeReferer) {
   const { valid, error } = validateUrl(targetUrl);
   if (!valid) return res.status(400).json({ error });
 
-  console.log(`📺 M3U8 Request (referer=${includeReferer}):`, targetUrl);
+  // Optional host override — sets the HTTP Host header on the upstream request so
+  // CDNs / virtual-hosted origins receive the correct SNI / vhost.
+  const hostOverride = (req.query.host || '').trim();
+
+  console.log(`📺 M3U8 Request (referer=${includeReferer}${hostOverride ? ', host=' + hostOverride : ''}):`, targetUrl);
 
   try {
     const customHeaders = parseCustomHeaders(req.query);
     if (!includeReferer) { delete customHeaders['Referer']; delete customHeaders['referer']; }
 
     const requestHeaders = buildRequestHeaders(customHeaders, includeReferer);
+
+    // Inject the Host override AFTER buildRequestHeaders so it always wins.
+    if (hostOverride) {
+      requestHeaders['Host'] = hostOverride;
+    }
+
     const targetResponse = await fetchWithRetry(targetUrl, { headers: requestHeaders }, RETRY_CONFIG.maxRetries, TIMEOUT_MS, true);
 
     if (!targetResponse.ok) {
@@ -479,7 +493,8 @@ async function handleM3U8(req, res, includeReferer) {
     let m3u8Content = await targetResponse.text();
     const baseUrl    = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const proxyBase  = `https://${req.get('host')}`;
-    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders);
+    // Pass hostOverride so every rewritten segment / sub-playlist URL also carries host=
+    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride);
 
     res.setHeader('Content-Type',  'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
@@ -559,6 +574,9 @@ app.get('/ts-proxy', async (req, res) => {
   const { valid, error } = validateUrl(targetUrl);
   if (!valid) return res.status(400).json({ error });
 
+  // Optional host override — same mechanism as m3u8-proxy
+  const hostOverride = (req.query.host || '').trim();
+
   // --- Cache check ---
   const cacheKey = targetUrl;
   const cached   = segmentCache.get(cacheKey);
@@ -580,6 +598,11 @@ app.get('/ts-proxy', async (req, res) => {
   try {
     const customHeaders  = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
+
+    // Inject the Host override AFTER buildRequestHeaders so it always wins.
+    if (hostOverride) {
+      requestHeaders['Host'] = hostOverride;
+    }
 
     const rangeHeader = req.get('Range');
     if (rangeHeader) requestHeaders['Range'] = rangeHeader;
@@ -749,9 +772,9 @@ app.use((req, res) => {
     error: 'Not Found',
     availableEndpoints: [
       '/health',
-      '/m3u8-proxy?url=<url>&headers=<json>',
-      '/m3u8-proxy-no-referer?url=<url>&headers=<json>',
-      '/ts-proxy?url=<url>&headers=<json>',
+      '/m3u8-proxy?url=<url>&headers=<json>&host=<hostname>',
+      '/m3u8-proxy-no-referer?url=<url>&headers=<json>&host=<hostname>',
+      '/ts-proxy?url=<url>&headers=<json>&host=<hostname>',
       '/mp4-proxy?url=<url>&headers=<json>',
       '/fetch?url=<url>&headers=<json>',
       '/fetch-no-referer?url=<url>&headers=<json>',
