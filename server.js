@@ -58,82 +58,18 @@ function selectAgent(url, hostOverride) {
 // ---------------------------------------------------------------------------
 
 const RETRY_CONFIG = {
-  maxRetries:        2,
+  maxRetries:        2,   // M3U8 / generic
+  segmentMaxRetries: 1,   // TS segments — one retry only; stale URLs won't improve
   initialDelay:      25,
   maxDelay:          300,
   backoffMultiplier: 2,
 };
 
 const TIMEOUT_MS         = 15000; // M3U8 / generic requests
-const SEGMENT_TIMEOUT_MS = 10000; // TS segments
+const SEGMENT_TIMEOUT_MS =  5000; // TS segments — kept tight so retries fail fast
 
-// Max memory budget for the TS segment cache (default 128 MB, override via env)
-const CACHE_MAX_BYTES = parseInt(process.env.CACHE_MAX_BYTES, 10) || 128 * 1024 * 1024;
-
-// Don't cache individual segments larger than 10 % of the total budget
-const CACHE_MAX_SINGLE_BYTES = Math.floor(CACHE_MAX_BYTES * 0.1);
-
-// ---------------------------------------------------------------------------
-// LRU Segment Cache
-// ---------------------------------------------------------------------------
-// Uses a Map (whose iteration order is insertion order) as the backing store.
-// On every cache hit the entry is moved to the end (most-recently-used).
-// On every cache set we evict from the front (least-recently-used) until the
-// byte budget is satisfied.
-// ---------------------------------------------------------------------------
-
-class LRUSegmentCache {
-  constructor(maxBytes) {
-    this.maxBytes   = maxBytes;
-    this.totalBytes = 0;
-    this.map        = new Map(); // url → { buf: Buffer, size: number, hits: number }
-  }
-
-  get(key) {
-    const entry = this.map.get(key);
-    if (!entry) return null;
-
-    // Refresh position to "most recently used"
-    this.map.delete(key);
-    this.map.set(key, entry);
-    entry.hits++;
-    return entry.buf;
-  }
-
-  set(key, buf) {
-    const size = buf.length;
-
-    // Skip items that are individually too large
-    if (size > CACHE_MAX_SINGLE_BYTES) return;
-
-    // Remove stale entry for the same key first
-    if (this.map.has(key)) {
-      this.totalBytes -= this.map.get(key).size;
-      this.map.delete(key);
-    }
-
-    // Evict LRU entries until there is room
-    while (this.totalBytes + size > this.maxBytes && this.map.size > 0) {
-      const lruKey = this.map.keys().next().value;
-      this.totalBytes -= this.map.get(lruKey).size;
-      this.map.delete(lruKey);
-    }
-
-    this.map.set(key, { buf, size, hits: 0 });
-    this.totalBytes += size;
-  }
-
-  stats() {
-    return {
-      entries:      this.map.size,
-      totalMB:      (this.totalBytes / 1024 / 1024).toFixed(2),
-      maxMB:        (this.maxBytes   / 1024 / 1024).toFixed(2),
-      usagePct:     Math.round((this.totalBytes / this.maxBytes) * 100),
-    };
-  }
-}
-
-const segmentCache = new LRUSegmentCache(CACHE_MAX_BYTES);
+// (LRU segment cache removed — segments are streamed directly to avoid
+//  buffering latency and the cache was not the source of slowness anyway)
 
 // ---------------------------------------------------------------------------
 // Anti-bot: rotating User-Agents and Accept-Language variants
@@ -597,7 +533,6 @@ app.get('/health', (req, res) => {
   res.json({
     status:    'ok',
     timestamp: new Date().toISOString(),
-    cache:     segmentCache.stats(),
   });
 });
 
@@ -605,7 +540,7 @@ app.get('/health', (req, res) => {
 app.get('/m3u8-proxy',           (req, res) => handleM3U8(req, res, true));
 app.get('/m3u8-proxy-no-referer',(req, res) => handleM3U8(req, res, false));
 
-// TS / segment proxy — with LRU caching
+// TS / segment proxy — streams directly, no caching
 app.get('/ts-proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
@@ -615,18 +550,6 @@ app.get('/ts-proxy', async (req, res) => {
 
   // Optional host override — same mechanism as m3u8-proxy
   const hostOverride = (req.query.host || '').trim();
-
-  // --- Cache check ---
-  const cacheKey = targetUrl;
-  const cached   = segmentCache.get(cacheKey);
-  if (cached) {
-    res.setHeader('Content-Type',      'video/MP2T');
-    res.setHeader('Content-Length',    cached.length);
-    res.setHeader('Accept-Ranges',     'bytes');
-    res.setHeader('X-Cache-Hit',       'HIT');
-    res.setHeader('Cache-Control',     'public, max-age=3600');
-    return res.end(cached);
-  }
 
   // A single AbortController whose signal we hand to the fetch calls.
   // The timeout for each individual attempt is managed INSIDE _fetchWithRetryCore
@@ -649,7 +572,7 @@ app.get('/ts-proxy', async (req, res) => {
     const targetResponse = await _fetchWithRetryCore(
       targetUrl,
       { headers: requestHeaders, signal: clientController.signal },
-      RETRY_CONFIG.maxRetries,
+      RETRY_CONFIG.segmentMaxRetries,
       SEGMENT_TIMEOUT_MS
     );
 
@@ -664,39 +587,13 @@ app.get('/ts-proxy', async (req, res) => {
     res.setHeader('Content-Type',      contentType);
     res.setHeader('Accept-Ranges',     'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
-    res.setHeader('X-Cache-Hit',       'MISS');
-    // Do NOT forward Content-Length yet — the upstream value can't be trusted until
-    // we know whether node-fetch decoded/decompressed the body.  We'll set the real
-    // value once we have the buffer (buffered path) or omit it entirely (streaming path).
+    if (contentLength) res.setHeader('Content-Length', contentLength);
 
     forwardResponseHeaders(targetResponse, res);
 
-    const declaredSize = contentLength ? parseInt(contentLength, 10) : Infinity;
-
-    if (!rangeHeader && declaredSize <= CACHE_MAX_SINGLE_BYTES) {
-      const chunks = [];
-      targetResponse.body.on('data',  chunk => chunks.push(chunk));
-      targetResponse.body.on('end',   () => {
-        clearTimeout(targetResponse._bodyTimeoutId);
-        const buf = Buffer.concat(chunks);
-        segmentCache.set(cacheKey, buf);
-        if (!res.writableEnded) {
-          // Set the real Content-Length now that we know the exact byte count.
-          res.setHeader('Content-Length', buf.length);
-          res.end(buf);
-        }
-      });
-      targetResponse.body.on('error', err => {
-        clearTimeout(targetResponse._bodyTimeoutId);
-        console.error('❌ Segment stream error:', err.message);
-        if (!res.headersSent) res.status(502).json({ error: 'Stream error', message: err.message });
-        else res.destroy();
-      });
-      res.on('close', () => { clientController.abort(); targetResponse.body.destroy(); });
-    } else {
-      // Too large or range request — stream directly without caching
-      streamResponse(targetResponse, res, clientController);
-    }
+    // Always stream directly — no buffering, no caching.
+    // Data starts flowing to the client as soon as the first bytes arrive.
+    streamResponse(targetResponse, res, clientController);
 
   } catch (err) {
     console.error('❌ Segment proxy error:', err);
@@ -834,5 +731,4 @@ app.use((err, req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/health`);
-  console.log(`💾 TS segment cache: ${(CACHE_MAX_BYTES / 1024 / 1024).toFixed(0)} MB budget`);
 });
