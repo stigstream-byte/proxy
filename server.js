@@ -19,6 +19,41 @@ const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 64 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
 
 // ---------------------------------------------------------------------------
+// Agent selection
+// ---------------------------------------------------------------------------
+// When a Host override is in play the shared pool MUST NOT be used because:
+//   1. TLS SNI — the shared httpsAgent derives servername from the URL hostname.
+//      If the real vhost differs (e.g. hitting a CDN IP), the TLS handshake
+//      fails or returns the wrong certificate.
+//   2. Pool contamination — a bad/mismatched connection stored in the shared
+//      pool gets re-used for normal requests, causing intermittent failures
+//      across ALL endpoints even when no host override is set.
+//
+// The fix: for host-override HTTPS requests, create a short-lived agent with
+// the correct servername and keepAlive disabled so it never touches the pool.
+// ---------------------------------------------------------------------------
+
+function selectAgent(url, hostOverride) {
+  const isHttps = url.startsWith('https');
+
+  if (hostOverride && isHttps) {
+    // Fresh one-shot agent: correct SNI servername, never pooled.
+    return new https.Agent({
+      keepAlive:  false,
+      servername: hostOverride, // TLS SNI matches the virtual host, not the URL IP
+    });
+  }
+
+  if (hostOverride) {
+    // HTTP with host override — isolated pool keyed to this override only,
+    // so it can't contaminate the shared httpAgent pool.
+    return new http.Agent({ keepAlive: false });
+  }
+
+  return isHttps ? httpsAgent : httpAgent;
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -274,7 +309,11 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
 // ---------------------------------------------------------------------------
 
 async function _fetchWithRetryCore(url, options, retries, timeoutMs) {
-  const agent = url.startsWith('https') ? httpsAgent : httpAgent;
+  // Extract the Host override (if any) so we can select the right agent.
+  // We read it from headers here rather than threading a separate param through
+  // the whole call stack.
+  const hostOverride = options?.headers?.['Host'] || '';
+  const agent = selectAgent(url, hostOverride);
   let lastError;
   let delay = RETRY_CONFIG.initialDelay;
 
