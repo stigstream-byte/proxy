@@ -14,9 +14,11 @@ const PORT = process.env.PORT || 3000;
 // Trust reverse proxy headers (e.g. X-Forwarded-Proto from nginx/Cloudflare)
 app.set('trust proxy', true);
 
-// Keep-alive agents for connection reuse — dramatically reduces latency for repeated upstream requests
-const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 64 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64 });
+// Keep-alive agents for connection reuse — dramatically reduces latency for repeated upstream requests.
+// maxSockets raised to 128: movies/TV at high quality generate many concurrent segment requests
+// (video + audio + subtitles at multiple qualities during ABR switching).
+const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 128, maxFreeSockets: 32 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 128, maxFreeSockets: 32 });
 
 // ---------------------------------------------------------------------------
 // Agent selection
@@ -65,8 +67,42 @@ const RETRY_CONFIG = {
   backoffMultiplier: 2,
 };
 
-const TIMEOUT_MS         = 15000; // M3U8 / generic requests
-const SEGMENT_TIMEOUT_MS =  5000; // TS segments — kept tight so retries fail fast
+const TIMEOUT_MS         = 15000; // M3U8 / MPD / generic requests
+const SEGMENT_TIMEOUT_MS =  8000; // TS / fMP4 segments — balanced for 1080p on slow CDNs
+const MP4_TIMEOUT_MS     = 30000; // Progressive MP4 — large files, range requests for seeking
+
+// ---------------------------------------------------------------------------
+// Quality / bandwidth detection helpers
+// ---------------------------------------------------------------------------
+// Extracts bandwidth from an #EXT-X-STREAM-INF line for logging purposes.
+function parseBandwidth(streamInfLine) {
+  const m = streamInfLine.match(/BANDWIDTH=(\d+)/i);
+  return m ? Math.round(parseInt(m[1], 10) / 1000) + ' kbps' : 'unknown';
+}
+
+// Maps a rough bandwidth (bps) to a human-readable quality label.
+function bandwidthToQuality(bps) {
+  if (!bps) return '';
+  if (bps >= 4_000_000) return '1080p+';
+  if (bps >= 2_000_000) return '1080p';
+  if (bps >= 1_200_000) return '720p';
+  if (bps >= 600_000)   return '480p';
+  if (bps >= 300_000)   return '360p';
+  return '240p or lower';
+}
+
+// Detects fMP4 segment MIME type by URL extension.
+function segmentContentType(url) {
+  if (/\.mp4(\?|$)/i.test(url) || /\.m4s(\?|$)/i.test(url) || /\.m4v(\?|$)/i.test(url)) {
+    return 'video/mp4';
+  }
+  if (/\.aac(\?|$)/i.test(url) || /\.m4a(\?|$)/i.test(url)) {
+    return 'audio/mp4';
+  }
+  if (/\.vtt(\?|$)/i.test(url)) return 'text/vtt';
+  if (/\.webm(\?|$)/i.test(url)) return 'video/webm';
+  return 'video/MP2T'; // default: MPEG-TS
+}
 
 // (LRU segment cache removed — segments are streamed directly to avoid
 //  buffering latency and the cache was not the source of slowness anyway)
@@ -381,53 +417,139 @@ function streamResponse(upstreamResponse, res, abortController) {
 // ---------------------------------------------------------------------------
 // M3U8 rewriter
 // ---------------------------------------------------------------------------
+// Handles both master playlists (multi-quality) and media playlists (segments).
+//
+// Master playlist lines to rewrite:
+//   #EXT-X-STREAM-INF   — variant stream (video at a given quality)
+//   #EXT-X-I-FRAME-STREAM-INF — I-frame trick-play variants (URI= attribute)
+//   #EXT-X-MEDIA        — alternate renditions: audio tracks, subtitles, CC
+//   #EXT-X-SESSION-DATA — external JSON data referenced by URI
+//
+// Media playlist lines to rewrite:
+//   #EXT-X-KEY          — AES-128 / SAMPLE-AES encryption key
+//   #EXT-X-MAP          — fMP4 initialisation segment (EXT-X-MAP URI)
+//   Bare URL lines      — actual media segments (.ts, .m4s, .mp4, .aac …)
+//
+// Sub-playlists (*.m3u8 / variant indicators) are routed to /m3u8-proxy so
+// the proxy can rewrite them in turn.  Everything else goes to /ts-proxy.
+// ---------------------------------------------------------------------------
 
 function rewriteM3U8Content(m3u8Content, baseUrl, proxyBaseUrl, customHeaders = {}, hostOverride = '') {
   const headersParam = Object.keys(customHeaders).length > 0
     ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
     : '';
 
-  // Propagate the host= param so every child request (segments, sub-playlists,
-  // keys, init segments) also sends the correct Host header upstream.
   const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
 
-  return m3u8Content.split('\n').map(line => {
-    const t = line.trim();
-    if (!t) return line;
+  const suffix = headersParam + hostParam;
 
-    if (t.startsWith('#EXT-X-KEY:') || t.startsWith('#EXT-X-MEDIA:') || t.startsWith('#EXT-X-MAP:')) {
-      try {
-        const match = t.match(/URI="([^"]+)"/);
-        if (match) {
-          const abs = new URL(match[1], baseUrl).href;
-          let endpoint;
-          if (t.startsWith('#EXT-X-KEY:'))    endpoint = '/fetch';
-          else if (t.startsWith('#EXT-X-MAP:')) endpoint = '/ts-proxy';
-          else                                  endpoint = '/m3u8-proxy';
-          const proxied = `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(abs)}${headersParam}${hostParam}`;
-          return t.replace(/URI="[^"]+"/, `URI="${proxied}"`);
-        }
-      } catch (err) {
-        console.warn('Failed to rewrite tag URI:', err.message);
-      }
-      return line;
+  // Resolve a potentially-relative URL against the playlist base.
+  function abs(href) {
+    try { return new URL(href, baseUrl).href; } catch { return href; }
+  }
+
+  // Decide the proxy endpoint for a resolved URL.
+  function endpointFor(resolvedUrl) {
+    if (
+      /\.m3u8(\?|$)/i.test(resolvedUrl) ||
+      /[?&]type=(video|audio|subtitle)(&|$)/i.test(resolvedUrl) ||
+      resolvedUrl.includes('/playlist/')  ||
+      resolvedUrl.includes('/master/')    ||
+      resolvedUrl.includes('/index.m3u8')
+    ) return '/m3u8-proxy';
+    return '/ts-proxy';
+  }
+
+  function proxyUrl(href) {
+    const resolved = abs(href);
+    const ep = endpointFor(resolved);
+    return `${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}`;
+  }
+
+  // Rewrite a URI="…" attribute inside a tag line.
+  function rewriteUriAttr(line, forcedEndpoint) {
+    return line.replace(/URI="([^"]+)"/gi, (_, href) => {
+      const resolved = abs(href);
+      const ep = forcedEndpoint || endpointFor(resolved);
+      return `URI="${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}"`;
+    });
+  }
+
+  const lines  = m3u8Content.split('\n');
+  const out    = [];
+  let   expectVariantUrl = false; // true when next non-comment line is a variant URL
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const t   = raw.trim();
+
+    if (!t) { out.push(raw); continue; }
+
+    // ── Master playlist tags ──────────────────────────────────────────────
+
+    if (t.startsWith('#EXT-X-STREAM-INF')) {
+      // Log quality info for debugging
+      const bwMatch = t.match(/BANDWIDTH=(\d+)/i);
+      const res     = t.match(/RESOLUTION=(\d+x\d+)/i);
+      const bw      = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+      console.log(`  📊 Variant: ${res ? res[1] : '?'} — ${bandwidthToQuality(bw)} (${parseBandwidth(t)})`);
+      out.push(raw);
+      expectVariantUrl = true;
+      continue;
     }
 
-    if (t.startsWith('#')) return line;
+    if (t.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
+      // Inline URI= attribute — rewrite in place, no following URL line
+      out.push(rewriteUriAttr(t, '/m3u8-proxy'));
+      continue;
+    }
 
+    if (t.startsWith('#EXT-X-MEDIA:')) {
+      // Audio tracks, subtitle tracks, closed captions — URI is optional
+      out.push(rewriteUriAttr(t, '/m3u8-proxy'));
+      continue;
+    }
+
+    if (t.startsWith('#EXT-X-SESSION-DATA:')) {
+      out.push(rewriteUriAttr(t));
+      continue;
+    }
+
+    // ── Media playlist tags ───────────────────────────────────────────────
+
+    if (t.startsWith('#EXT-X-KEY:')) {
+      // Encryption key — always fetch via /fetch so we don't alter the binary
+      out.push(rewriteUriAttr(t, '/fetch'));
+      continue;
+    }
+
+    if (t.startsWith('#EXT-X-MAP:')) {
+      // fMP4 initialisation segment — always a binary resource → /ts-proxy
+      out.push(rewriteUriAttr(t, '/ts-proxy'));
+      continue;
+    }
+
+    // Pass all other tags through unchanged
+    if (t.startsWith('#')) { out.push(raw); continue; }
+
+    // ── URL lines (variant playlists or media segments) ───────────────────
+
+    if (expectVariantUrl) {
+      out.push(`${proxyBaseUrl}/m3u8-proxy?url=${encodeURIComponent(abs(t))}${suffix}`);
+      expectVariantUrl = false;
+      continue;
+    }
+
+    // Regular segment line
     try {
-      const abs = new URL(t, baseUrl).href;
-      const isPlaylist =
-        /\.m3u8(\?.*)?$/i.test(abs) ||
-        /[?&]type=(video|audio|subtitle)(&|$)/i.test(abs) ||
-        abs.includes('/playlist/');
-      const endpoint = isPlaylist ? '/m3u8-proxy' : '/ts-proxy';
-      return `${proxyBaseUrl}${endpoint}?url=${encodeURIComponent(abs)}${headersParam}${hostParam}`;
+      out.push(proxyUrl(t));
     } catch (err) {
-      console.warn('Failed to rewrite line:', t, err.message);
-      return line;
+      console.warn('⚠️  Failed to rewrite segment line:', t, err.message);
+      out.push(raw);
     }
-  }).join('\n');
+  }
+
+  return out.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -441,8 +563,6 @@ async function handleM3U8(req, res, includeReferer) {
   const { valid, error } = validateUrl(targetUrl);
   if (!valid) return res.status(400).json({ error });
 
-  // Optional host override — sets the HTTP Host header on the upstream request so
-  // CDNs / virtual-hosted origins receive the correct SNI / vhost.
   const hostOverride = (req.query.host || '').trim();
 
   console.log(`📺 M3U8 Request (referer=${includeReferer}${hostOverride ? ', host=' + hostOverride : ''}):`, targetUrl);
@@ -453,7 +573,6 @@ async function handleM3U8(req, res, includeReferer) {
 
     const requestHeaders = buildRequestHeaders(customHeaders, includeReferer);
 
-    // Inject the Host override AFTER buildRequestHeaders so it always wins.
     if (hostOverride) {
       requestHeaders['Host'] = hostOverride;
     }
@@ -466,9 +585,23 @@ async function handleM3U8(req, res, includeReferer) {
     }
 
     let m3u8Content = await targetResponse.text();
-    const baseUrl    = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    const proxyBase  = `https://${req.get('host')}`;
-    // Pass hostOverride so every rewritten segment / sub-playlist URL also carries host=
+
+    // Detect master vs media playlist and log accordingly
+    const isMaster = m3u8Content.includes('#EXT-X-STREAM-INF') || m3u8Content.includes('#EXT-X-I-FRAME-STREAM-INF');
+    if (isMaster) {
+      const variantCount = (m3u8Content.match(/#EXT-X-STREAM-INF/gi) || []).length;
+      console.log(`  🎬 Master playlist — ${variantCount} quality variant(s)`);
+    } else {
+      const segCount = m3u8Content.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length;
+      const duration = (() => {
+        const m = m3u8Content.match(/#EXT-X-TARGETDURATION:(\d+)/i);
+        return m ? `${m[1]}s target duration` : '';
+      })();
+      console.log(`  📼 Media playlist — ~${segCount} segment(s)${duration ? ', ' + duration : ''}`);
+    }
+
+    const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+    const proxyBase = `https://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride);
 
     res.setHeader('Content-Type',  'application/vnd.apple.mpegurl');
@@ -540,7 +673,8 @@ app.get('/health', (req, res) => {
 app.get('/m3u8-proxy',           (req, res) => handleM3U8(req, res, true));
 app.get('/m3u8-proxy-no-referer',(req, res) => handleM3U8(req, res, false));
 
-// TS / segment proxy — streams directly, no caching
+// TS / segment proxy — handles MPEG-TS (.ts), fMP4 (.m4s/.mp4/.m4v), AAC (.aac/.m4a),
+// WebM (.webm), and VTT subtitle segments. Streams directly, no caching.
 app.get('/ts-proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
@@ -548,12 +682,8 @@ app.get('/ts-proxy', async (req, res) => {
   const { valid, error } = validateUrl(targetUrl);
   if (!valid) return res.status(400).json({ error });
 
-  // Optional host override — same mechanism as m3u8-proxy
   const hostOverride = (req.query.host || '').trim();
 
-  // A single AbortController whose signal we hand to the fetch calls.
-  // The timeout for each individual attempt is managed INSIDE _fetchWithRetryCore
-  // with a per-attempt controller, so we only use this one for client-disconnect.
   const clientController = new AbortController();
   req.on('close', () => clientController.abort());
 
@@ -561,7 +691,6 @@ app.get('/ts-proxy', async (req, res) => {
     const customHeaders  = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
-    // Inject the Host override AFTER buildRequestHeaders so it always wins.
     if (hostOverride) {
       requestHeaders['Host'] = hostOverride;
     }
@@ -576,38 +705,49 @@ app.get('/ts-proxy', async (req, res) => {
       SEGMENT_TIMEOUT_MS
     );
 
-    if (!targetResponse.ok) {
-      console.error('❌ Segment fetch failed:', targetResponse.status);
+    // Accept both 200 OK and 206 Partial Content
+    if (!targetResponse.ok && targetResponse.status !== 206) {
+      console.error('❌ Segment fetch failed:', targetResponse.status, targetUrl);
       return res.status(targetResponse.status).json({ error: 'Failed to fetch segment', status: targetResponse.status });
     }
 
-    const contentType   = targetResponse.headers.get('content-type')   || 'video/MP2T';
+    // Determine correct MIME type — upstream may return wrong/generic types
+    const upstreamType  = targetResponse.headers.get('content-type') || '';
+    const contentType   = (upstreamType && upstreamType !== 'application/octet-stream')
+      ? upstreamType
+      : segmentContentType(targetUrl);
     const contentLength = targetResponse.headers.get('content-length');
+    const contentRange  = targetResponse.headers.get('content-range');
 
+    res.status(targetResponse.status);
     res.setHeader('Content-Type',      contentType);
     res.setHeader('Accept-Ranges',     'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
     if (contentLength) res.setHeader('Content-Length', contentLength);
+    if (contentRange)  res.setHeader('Content-Range',  contentRange);
 
     forwardResponseHeaders(targetResponse, res);
 
-    // Always stream directly — no buffering, no caching.
-    // Data starts flowing to the client as soon as the first bytes arrive.
+    // Stream directly — data flows to the client as soon as first bytes arrive.
     streamResponse(targetResponse, res, clientController);
 
   } catch (err) {
-    console.error('❌ Segment proxy error:', err);
+    console.error('❌ Segment proxy error:', err.message);
     if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: err.message, type: err.name });
   }
 });
 
-// MP4 proxy
+// MP4 proxy — progressive download with full Range/seek support for movies & TV.
+// Uses a longer timeout (MP4_TIMEOUT_MS) since a single range chunk from a
+// 1080p movie can be several MB over a slow upstream CDN.
 app.get('/mp4-proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
 
   const { valid, error } = validateUrl(targetUrl);
   if (!valid) return res.status(400).json({ error });
+
+  const hostOverride = (req.query.host || '').trim();
 
   console.log('🎬 MP4 Request:', targetUrl);
 
@@ -618,29 +758,122 @@ app.get('/mp4-proxy', async (req, res) => {
     const customHeaders  = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
 
+    if (hostOverride) requestHeaders['Host'] = hostOverride;
+
     const rangeHeader = req.get('Range');
     if (rangeHeader) requestHeaders['Range'] = rangeHeader;
 
-    const targetResponse = await fetchWithRetry(targetUrl, { headers: requestHeaders, signal: clientController.signal });
+    const targetResponse = await _fetchWithRetryCore(
+      targetUrl,
+      { headers: requestHeaders, signal: clientController.signal },
+      RETRY_CONFIG.maxRetries,
+      MP4_TIMEOUT_MS
+    );
 
-    if (!targetResponse.ok) {
+    // Accept 200 (full file) and 206 (range/seek)
+    if (!targetResponse.ok && targetResponse.status !== 206) {
       console.error('❌ MP4 fetch failed:', targetResponse.status);
       return res.status(targetResponse.status).json({ error: 'Failed to fetch MP4', status: targetResponse.status });
     }
 
     const contentType   = targetResponse.headers.get('content-type')   || 'video/mp4';
     const contentLength = targetResponse.headers.get('content-length');
+    const contentRange  = targetResponse.headers.get('content-range');
+    const acceptRanges  = targetResponse.headers.get('accept-ranges');
 
+    res.status(targetResponse.status);
     res.setHeader('Content-Type',      contentType);
-    res.setHeader('Accept-Ranges',     'bytes');
+    res.setHeader('Accept-Ranges',     acceptRanges || 'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
     if (contentLength) res.setHeader('Content-Length', contentLength);
+    if (contentRange)  res.setHeader('Content-Range',  contentRange);
 
     forwardResponseHeaders(targetResponse, res);
     streamResponse(targetResponse, res, clientController);
 
   } catch (err) {
     console.error('❌ MP4 proxy error:', err);
+    if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: err.message, type: err.name });
+  }
+});
+
+// DASH / MPD proxy — rewrites all relative URLs in the manifest so that
+// initialisation segments (.mp4 init), media segments (.m4s / .mp4 chunks),
+// and sub-period manifests are all fetched through this proxy.
+app.get('/mpd-proxy', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).json({ error: 'Missing url parameter' });
+
+  const { valid, error } = validateUrl(targetUrl);
+  if (!valid) return res.status(400).json({ error });
+
+  const hostOverride = (req.query.host || '').trim();
+
+  console.log('📡 MPD (DASH) Request:', targetUrl);
+
+  const clientController = new AbortController();
+  req.on('close', () => clientController.abort());
+
+  try {
+    const customHeaders  = parseCustomHeaders(req.query);
+    const requestHeaders = buildRequestHeaders(customHeaders, true);
+
+    if (hostOverride) requestHeaders['Host'] = hostOverride;
+
+    const targetResponse = await fetchWithRetry(targetUrl, { headers: requestHeaders, signal: clientController.signal }, RETRY_CONFIG.maxRetries, TIMEOUT_MS, true);
+
+    if (!targetResponse.ok) {
+      console.error('❌ MPD fetch failed:', targetResponse.status);
+      return res.status(targetResponse.status).json({ error: 'Failed to fetch MPD', status: targetResponse.status });
+    }
+
+    let mpdContent = await targetResponse.text();
+
+    const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+    const proxyBase = `https://${req.get('host')}`;
+
+    const headersParam = Object.keys(customHeaders).length > 0
+      ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
+      : '';
+    const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
+    const suffix = headersParam + hostParam;
+
+    function resolveAndProxy(href, endpoint) {
+      try {
+        const resolved = new URL(href, baseUrl).href;
+        return `${proxyBase}${endpoint}?url=${encodeURIComponent(resolved)}${suffix}`;
+      } catch { return href; }
+    }
+
+    // Rewrite initialization and media segment templates
+    mpdContent = mpdContent
+      // SegmentTemplate sourceURL and media/initialization attributes
+      .replace(/\binitialization="([^"]+)"/gi, (_, u) => `initialization="${resolveAndProxy(u, '/ts-proxy')}"`)
+      .replace(/\bmedia="([^"]+)"/gi,          (_, u) => `media="${resolveAndProxy(u, '/ts-proxy')}"`)
+      // SegmentBase and SegmentList with explicit URLs
+      .replace(/\bsourceURL="([^"]+)"/gi,      (_, u) => `sourceURL="${resolveAndProxy(u, '/ts-proxy')}"`)
+      // BaseURL elements
+      .replace(/<BaseURL>([^<]+)<\/BaseURL>/gi, (_, u) => {
+        const proxied = resolveAndProxy(u.trim(), '/ts-proxy');
+        return `<BaseURL>${proxied}</BaseURL>`;
+      })
+      // SegmentList SegmentURL media= and index= attributes
+      .replace(/\bmediaRange="([^"]+)"/gi, (_, u) => `mediaRange="${u}"`) // keep ranges as-is
+      ;
+
+    // Log representation quality info
+    const repMatches = [...mpdContent.matchAll(/bandwidth="(\d+)"/gi)];
+    if (repMatches.length) {
+      const bandwidths = repMatches.map(m => parseInt(m[1], 10)).sort((a, b) => a - b);
+      console.log(`  📊 DASH representations: ${bandwidths.map(b => bandwidthToQuality(b)).join(', ')}`);
+    }
+
+    res.setHeader('Content-Type',  'application/dash+xml');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.send(mpdContent);
+
+  } catch (err) {
+    console.error('❌ MPD proxy error:', err);
     if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: err.message, type: err.name });
   }
 });
@@ -708,13 +941,14 @@ app.use((req, res) => {
     error: 'Not Found',
     availableEndpoints: [
       '/health',
-      '/m3u8-proxy?url=<url>&headers=<json>&host=<hostname>',
+      '/m3u8-proxy?url=<url>&headers=<json>&host=<hostname>          — HLS master or media playlist',
       '/m3u8-proxy-no-referer?url=<url>&headers=<json>&host=<hostname>',
-      '/ts-proxy?url=<url>&headers=<json>&host=<hostname>',
-      '/mp4-proxy?url=<url>&headers=<json>',
-      '/fetch?url=<url>&headers=<json>',
+      '/mpd-proxy?url=<url>&headers=<json>&host=<hostname>           — MPEG-DASH manifest',
+      '/ts-proxy?url=<url>&headers=<json>&host=<hostname>            — TS / fMP4 / .m4s segments',
+      '/mp4-proxy?url=<url>&headers=<json>&host=<hostname>           — Progressive MP4 with seek/range',
+      '/fetch?url=<url>&headers=<json>                               — Generic resource (keys, etc.)',
       '/fetch-no-referer?url=<url>&headers=<json>',
-      '/subtitle?url=<url>&headers=<json>',
+      '/subtitle?url=<url>&headers=<json>                            — SRT / VTT subtitle conversion',
     ],
   });
 });
@@ -731,4 +965,5 @@ app.use((err, req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  console.log(`🎬 Endpoints: /m3u8-proxy  /mpd-proxy  /ts-proxy  /mp4-proxy  /fetch  /subtitle`);
 });
