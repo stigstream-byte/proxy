@@ -142,6 +142,7 @@ const pendingRequests = new Map();
 
 const BLOCKED_RESPONSE_HEADERS = new Set([
   'content-type',
+  'content-length',        // managed explicitly — never trust upstream's declared size
   'access-control-allow-origin',
   'access-control-allow-headers',
   'access-control-allow-methods',
@@ -278,17 +279,16 @@ async function _fetchWithRetryCore(url, options, retries, timeoutMs) {
   let delay = RETRY_CONFIG.initialDelay;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    // Use a FRESH AbortController for each attempt's timeout so that a timeout
-    // on attempt N doesn't permanently abort the signal used by attempt N+1.
     const attemptController = new AbortController();
 
-    // Merge with any caller-supplied signal (e.g. client-disconnect signal)
     const callerSignal = options?.signal;
     if (callerSignal?.aborted) throw new Error('Request aborted by caller');
 
     const onCallerAbort = () => attemptController.abort();
     callerSignal?.addEventListener('abort', onCallerAbort);
 
+    // The timeout covers the FULL round-trip including body — the caller is
+    // responsible for clearing response._bodyTimeoutId once the body is consumed.
     const timeoutId = setTimeout(() => attemptController.abort(), timeoutMs);
 
     try {
@@ -298,14 +298,24 @@ async function _fetchWithRetryCore(url, options, retries, timeoutMs) {
         signal: attemptController.signal,
       });
 
-      clearTimeout(timeoutId);
+      // Headers arrived — remove the one-shot caller-abort listener (it was for
+      // this attempt's controller) and re-wire client disconnect to also clear
+      // the still-running body timeout so we don't leave dangling timers.
       callerSignal?.removeEventListener('abort', onCallerAbort);
+      if (callerSignal) {
+        callerSignal.addEventListener('abort', () => {
+          clearTimeout(timeoutId);
+          attemptController.abort();
+        }, { once: true });
+      }
 
-      // Retry 5xx and 429; return everything else as-is
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
+        // Attach the body-timeout handle so the caller clears it after body read.
+        response._bodyTimeoutId = timeoutId;
         return response;
       }
 
+      clearTimeout(timeoutId);
       lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
       console.warn(`⚠️  Attempt ${attempt + 1} failed: ${lastError.message}`);
 
@@ -316,10 +326,7 @@ async function _fetchWithRetryCore(url, options, retries, timeoutMs) {
       lastError = error;
       console.warn(`⚠️  Attempt ${attempt + 1} failed: ${error.message}`);
 
-      // If the *caller* aborted (client disconnect), stop immediately
       if (callerSignal?.aborted) break;
-
-      // Don't retry a timeout either — the segment is likely unavailable
       if (error.name === 'AbortError') break;
     }
 
@@ -376,16 +383,22 @@ function forwardResponseHeaders(upstreamResponse, res) {
 function streamResponse(upstreamResponse, res, abortController) {
   const body = upstreamResponse.body;
 
+  const clearBodyTimeout = () => clearTimeout(upstreamResponse._bodyTimeoutId);
+
   res.on('close', () => {
+    clearBodyTimeout();
     abortController?.abort();
     body.destroy();
   });
 
   body.on('error', (err) => {
+    clearBodyTimeout();
     console.error('❌ Upstream stream error:', err.message);
     if (!res.headersSent) res.status(502).json({ error: 'Stream error', message: err.message });
     else res.destroy();
   });
+
+  body.on('end', clearBodyTimeout);
 
   body.pipe(res);
 }
@@ -590,24 +603,29 @@ app.get('/ts-proxy', async (req, res) => {
     res.setHeader('Accept-Ranges',     'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
     res.setHeader('X-Cache-Hit',       'MISS');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
+    // Do NOT forward Content-Length yet — the upstream value can't be trusted until
+    // we know whether node-fetch decoded/decompressed the body.  We'll set the real
+    // value once we have the buffer (buffered path) or omit it entirely (streaming path).
 
     forwardResponseHeaders(targetResponse, res);
 
-    // Buffer the segment so we can cache it, then send it
-    // Only buffer if we know the segment fits within our single-item cap
     const declaredSize = contentLength ? parseInt(contentLength, 10) : Infinity;
 
     if (!rangeHeader && declaredSize <= CACHE_MAX_SINGLE_BYTES) {
-      // Collect chunks into a buffer, then write once
       const chunks = [];
       targetResponse.body.on('data',  chunk => chunks.push(chunk));
       targetResponse.body.on('end',   () => {
+        clearTimeout(targetResponse._bodyTimeoutId);
         const buf = Buffer.concat(chunks);
         segmentCache.set(cacheKey, buf);
-        if (!res.writableEnded) res.end(buf);
+        if (!res.writableEnded) {
+          // Set the real Content-Length now that we know the exact byte count.
+          res.setHeader('Content-Length', buf.length);
+          res.end(buf);
+        }
       });
       targetResponse.body.on('error', err => {
+        clearTimeout(targetResponse._bodyTimeoutId);
         console.error('❌ Segment stream error:', err.message);
         if (!res.headersSent) res.status(502).json({ error: 'Stream error', message: err.message });
         else res.destroy();
