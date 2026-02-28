@@ -67,9 +67,16 @@ const RETRY_CONFIG = {
   backoffMultiplier: 2,
 };
 
-const TIMEOUT_MS         = 15000; // M3U8 / MPD / generic requests
-const SEGMENT_TIMEOUT_MS =  8000; // TS / fMP4 segments — balanced for 1080p on slow CDNs
-const MP4_TIMEOUT_MS     = 30000; // Progressive MP4 — large files, range requests for seeking
+const TIMEOUT_MS         = 15000; // M3U8 / MPD / generic — time-to-first-byte (TTFB) only
+const SEGMENT_TIMEOUT_MS =  8000; // TS / fMP4 TTFB — once streaming begins the stall timeout takes over
+const MP4_TIMEOUT_MS     = 30000; // MP4 TTFB — large files may take a moment to start
+
+// After headers arrive, the TTFB timeout is replaced by a per-chunk idle/stall
+// timeout. This allows arbitrarily large or slow streams to complete while still
+// killing connections that have genuinely gone silent mid-transfer.
+const SEGMENT_STALL_MS   = 20000; // 20 s idle → stalled TS/fMP4 segment
+const MP4_STALL_MS       = 30000; // 30 s idle → stalled MP4 (large files on slow CDNs)
+const DEFAULT_STALL_MS   = 25000; // generic fetch stall
 
 // ---------------------------------------------------------------------------
 // Quality / bandwidth detection helpers
@@ -391,25 +398,53 @@ function forwardResponseHeaders(upstreamResponse, res) {
   }
 }
 
-function streamResponse(upstreamResponse, res, abortController) {
+function streamResponse(upstreamResponse, res, abortController, stallTimeoutMs = DEFAULT_STALL_MS) {
   const body = upstreamResponse.body;
 
-  const clearBodyTimeout = () => clearTimeout(upstreamResponse._bodyTimeoutId);
+  // ── Phase 1 complete: TTFB timeout is no longer needed ──────────────────
+  // The TTFB timer was set in _fetchWithRetryCore to abort stalled connections
+  // before headers arrived. Headers are here now — clear it immediately.
+  // Leaving it running is the root cause of ERR_INCOMPLETE_CHUNKED_ENCODING:
+  // it fires mid-stream, aborts the upstream body, and Node closes the chunked
+  // response without the terminal 0-length chunk.
+  clearTimeout(upstreamResponse._bodyTimeoutId);
+
+  // ── Phase 2: per-chunk idle / stall timeout ──────────────────────────────
+  // Resets every time a chunk arrives. Only fires if the upstream goes
+  // completely silent for stallTimeoutMs — i.e. a genuine stall, not a
+  // large/slow file that is actively transferring.
+  let stallTimer;
+
+  function scheduleStall() {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      console.error(`❌ Upstream stall — no data for ${stallTimeoutMs}ms, aborting`);
+      abortController?.abort();
+      body.destroy(new Error('Upstream stall timeout'));
+    }, stallTimeoutMs);
+  }
+
+  function cancelStall() {
+    clearTimeout(stallTimer);
+  }
+
+  scheduleStall(); // arm immediately when streaming begins
+
+  body.on('data',  scheduleStall); // reset the clock on every chunk
+  body.on('end',   cancelStall);
+  body.on('error', cancelStall);
 
   res.on('close', () => {
-    clearBodyTimeout();
+    cancelStall();
     abortController?.abort();
     body.destroy();
   });
 
   body.on('error', (err) => {
-    clearBodyTimeout();
     console.error('❌ Upstream stream error:', err.message);
     if (!res.headersSent) res.status(502).json({ error: 'Stream error', message: err.message });
     else res.destroy();
   });
-
-  body.on('end', clearBodyTimeout);
 
   body.pipe(res);
 }
@@ -654,7 +689,7 @@ async function handleFetch(req, res, includeReferer) {
     if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
 
     forwardResponseHeaders(targetResponse, res);
-    streamResponse(targetResponse, res, clientController);
+    streamResponse(targetResponse, res, clientController, DEFAULT_STALL_MS);
 
   } catch (err) {
     console.error('❌ Fetch proxy error:', err);
@@ -738,7 +773,7 @@ app.get('/ts-proxy', async (req, res) => {
     forwardResponseHeaders(targetResponse, res);
 
     // Stream directly — data flows to the client as soon as first bytes arrive.
-    streamResponse(targetResponse, res, clientController);
+    streamResponse(targetResponse, res, clientController, SEGMENT_STALL_MS);
 
   } catch (err) {
     console.error('❌ Segment proxy error:', err.message);
@@ -802,7 +837,7 @@ app.get('/mp4-proxy', async (req, res) => {
     if (contentRange)  res.setHeader('Content-Range',  contentRange);
 
     forwardResponseHeaders(targetResponse, res);
-    streamResponse(targetResponse, res, clientController);
+    streamResponse(targetResponse, res, clientController, MP4_STALL_MS);
 
   } catch (err) {
     console.error('❌ MP4 proxy error:', err);
