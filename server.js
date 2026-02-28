@@ -256,7 +256,7 @@ function buildRequestHeaders(customHeaders = {}, includeReferer = true) {
     'User-Agent':         ua,
     'Accept':             '*/*',
     'Accept-Language':    pickRandom(ACCEPT_LANGUAGES),
-    'Accept-Encoding':    'identity', // Disable compression to avoid decoding issues when proxying
+    'Accept-Encoding':    'identity', // Disable compression — gzip would cause Content-Length mismatch after decompression
     'Cache-Control':      'no-cache',
     'Pragma':             'no-cache',
     'Connection':         'keep-alive',
@@ -642,11 +642,16 @@ async function handleFetch(req, res, includeReferer) {
 
     const contentType   = targetResponse.headers.get('content-type')   || 'application/octet-stream';
     const contentLength = targetResponse.headers.get('content-length');
+    const isRangeResponse = targetResponse.status === 206;
 
     res.setHeader('Content-Type',       contentType);
     res.setHeader('Accept-Ranges',      'bytes');
     res.setHeader('X-Upstream-Status',  targetResponse.status);
-    if (contentLength) res.setHeader('Content-Length', contentLength);
+    // Only forward Content-Length for range responses (206) where accuracy is
+    // guaranteed. For full-content streams, omit it to prevent
+    // ERR_CONTENT_LENGTH_MISMATCH when upstream returns fewer/more bytes than
+    // declared (e.g. due to ignored Accept-Encoding: identity, CDN quirks, etc.)
+    if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
 
     forwardResponseHeaders(targetResponse, res);
     streamResponse(targetResponse, res, clientController);
@@ -711,19 +716,23 @@ app.get('/ts-proxy', async (req, res) => {
       return res.status(targetResponse.status).json({ error: 'Failed to fetch segment', status: targetResponse.status });
     }
 
-    // Determine correct MIME type — upstream may return wrong/generic types
     const upstreamType  = targetResponse.headers.get('content-type') || '';
     const contentType   = (upstreamType && upstreamType !== 'application/octet-stream')
       ? upstreamType
       : segmentContentType(targetUrl);
     const contentLength = targetResponse.headers.get('content-length');
     const contentRange  = targetResponse.headers.get('content-range');
+    const isRangeResponse = targetResponse.status === 206;
 
     res.status(targetResponse.status);
     res.setHeader('Content-Type',      contentType);
     res.setHeader('Accept-Ranges',     'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
-    if (contentLength) res.setHeader('Content-Length', contentLength);
+    // Only forward Content-Length for 206 range responses where the upstream
+    // guarantees the byte count. Omitting it for 200 responses lets Express
+    // use chunked transfer encoding and avoids ERR_CONTENT_LENGTH_MISMATCH
+    // when the actual stream length diverges from the declared header.
+    if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
     if (contentRange)  res.setHeader('Content-Range',  contentRange);
 
     forwardResponseHeaders(targetResponse, res);
@@ -780,12 +789,16 @@ app.get('/mp4-proxy', async (req, res) => {
     const contentLength = targetResponse.headers.get('content-length');
     const contentRange  = targetResponse.headers.get('content-range');
     const acceptRanges  = targetResponse.headers.get('accept-ranges');
+    const isRangeResponse = targetResponse.status === 206;
 
     res.status(targetResponse.status);
     res.setHeader('Content-Type',      contentType);
     res.setHeader('Accept-Ranges',     acceptRanges || 'bytes');
     res.setHeader('X-Upstream-Status', targetResponse.status);
-    if (contentLength) res.setHeader('Content-Length', contentLength);
+    // Only forward Content-Length for 206 range responses. For full 200
+    // responses, suppress it to prevent ERR_CONTENT_LENGTH_MISMATCH — upstreams
+    // sometimes misreport the byte count (ignored identity encoding, CDN quirks).
+    if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
     if (contentRange)  res.setHeader('Content-Range',  contentRange);
 
     forwardResponseHeaders(targetResponse, res);
