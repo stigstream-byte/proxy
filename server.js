@@ -441,9 +441,19 @@ function streamResponse(upstreamResponse, res, abortController, stallTimeoutMs =
   });
 
   body.on('error', (err) => {
+    cancelStall(); // always cancel the stall timer on any stream error
+    // AbortError means the client disconnected or we intentionally aborted —
+    // either way the response is already gone so there is nothing to do.
+    if (err.name === 'AbortError' || err.code === 'ABORT_ERR') return;
     console.error('❌ Upstream stream error:', err.message);
-    if (!res.headersSent) res.status(502).json({ error: 'Stream error', message: err.message });
-    else res.destroy();
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Stream error', message: err.message });
+    } else {
+      // End the chunked response cleanly instead of res.destroy() — a TCP RST
+      // causes ERR_INCOMPLETE_CHUNKED_ENCODING on the client because the terminal
+      // 0-length chunk is never sent.  res.end() sends it before closing.
+      res.end();
+    }
   });
 
   body.pipe(res);
@@ -692,6 +702,7 @@ async function handleFetch(req, res, includeReferer) {
     streamResponse(targetResponse, res, clientController, DEFAULT_STALL_MS);
 
   } catch (err) {
+    if (err.name === 'AbortError' || err.code === 'ABORT_ERR') return;
     console.error('❌ Fetch proxy error:', err);
     if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: err.message, type: err.name });
   }
@@ -776,6 +787,9 @@ app.get('/ts-proxy', async (req, res) => {
     streamResponse(targetResponse, res, clientController, SEGMENT_STALL_MS);
 
   } catch (err) {
+    // AbortError = client disconnected before/during the upstream fetch.
+    // Don't log noise and don't try to write a 502 to a gone client.
+    if (err.name === 'AbortError' || err.code === 'ABORT_ERR') return;
     console.error('❌ Segment proxy error:', err.message);
     if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: err.message, type: err.name });
   }
@@ -840,6 +854,7 @@ app.get('/mp4-proxy', async (req, res) => {
     streamResponse(targetResponse, res, clientController, MP4_STALL_MS);
 
   } catch (err) {
+    if (err.name === 'AbortError' || err.code === 'ABORT_ERR') return;
     console.error('❌ MP4 proxy error:', err);
     if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: err.message, type: err.name });
   }
