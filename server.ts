@@ -559,7 +559,6 @@ function rewriteM3U8Content(
     }
 
     function endpointFor(resolvedUrl: string): string {
-        // Master playlist / variant / m3u8 files → Node
         if (
             /\.m3u8(\?|$)/i.test(resolvedUrl) ||
             /[?&]type=(video|audio|subtitle)(&|$)/i.test(resolvedUrl) ||
@@ -567,12 +566,7 @@ function rewriteM3U8Content(
             resolvedUrl.includes('/master/') ||
             resolvedUrl.includes('/index.m3u8')
         ) return '/m3u8-proxy';
-
-        // Media segments → Nginx
-        if (/\.ts$/i.test(resolvedUrl)) return '/stream/';
-
-        // Keys, init segments, maps etc (optional)
-        return '/fetch';
+        return '/stream';
     }
 
     function proxyUrl(href: string): string {
