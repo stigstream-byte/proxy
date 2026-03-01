@@ -634,7 +634,7 @@ function rewriteM3U8Content(
         }
 
         if (t.startsWith('#EXT-X-MAP:')) {
-            out.push(rewriteUriAttr(t, '/ts-proxy'));
+            out.push(rewriteUriAttr(t, '/stream'));
             continue;
         }
 
