@@ -572,7 +572,8 @@ function rewriteM3U8Content(
     function proxyUrl(href: string): string {
         const resolved = abs(href);
         const ep = endpointFor(resolved);
-        return `${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}`;
+        //return `${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}`;
+        return `${proxyBaseUrl}${ep}?url=${resolved}${suffix}`;
     }
 
     function rewriteUriAttr(line: string, forcedEndpoint?: string): string {
