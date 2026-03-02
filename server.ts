@@ -92,6 +92,10 @@ const app = express();
 // Trust reverse proxy headers (e.g. X-Forwarded-Proto from nginx/Cloudflare)
 app.set('trust proxy', true);
 
+// Disable Express's default unicode-escaping of <, >, & in JSON responses.
+// Those escapes exist to prevent XSS when JSON is inlined in HTML — irrelevant for a pure API.
+app.set('json escape', false);
+
 // Keep-alive agents — LIFO scheduling reuses warm connections aggressively,
 // cutting TLS handshake overhead on high-QPS segment bursts.
 // maxSockets: 256 for heavy concurrent segment loads at 1080p (video + audio + subtitles).
