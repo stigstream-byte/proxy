@@ -15,6 +15,18 @@ import { Readable } from 'stream';
 const { AbortController } = globalThis as unknown as { AbortController: typeof globalThis.AbortController };
 
 // ---------------------------------------------------------------------------
+// Process-level safety net
+// ---------------------------------------------------------------------------
+// node-fetch throws AbortError as an unhandled rejection when the signal fires
+// after the fetch promise has already settled but before the .catch() is wired.
+// This guard prevents those from crashing the process entirely.
+process.on('unhandledRejection', (reason: unknown) => {
+  const err = reason as Error | undefined;
+  if (err?.name === 'AbortError' || (err as NodeJS.ErrnoException)?.code === 'ABORT_ERR') return; // expected — client disconnect
+  console.error('Unhandled rejection:', reason);
+});
+
+// ---------------------------------------------------------------------------
 // Environment
 // ---------------------------------------------------------------------------
 
@@ -80,11 +92,11 @@ const app = express();
 // Trust reverse proxy headers (e.g. X-Forwarded-Proto from nginx/Cloudflare)
 app.set('trust proxy', true);
 
-// Keep-alive agents for connection reuse — dramatically reduces latency for repeated upstream requests.
-// maxSockets raised to 128: movies/TV at high quality generate many concurrent segment requests
-// (video + audio + subtitles at multiple qualities during ABR switching).
-const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 128, maxFreeSockets: 32 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 128, maxFreeSockets: 32 });
+// Keep-alive agents — LIFO scheduling reuses warm connections aggressively,
+// cutting TLS handshake overhead on high-QPS segment bursts.
+// maxSockets: 256 for heavy concurrent segment loads at 1080p (video + audio + subtitles).
+const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 64, scheduling: 'lifo' });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 64, scheduling: 'lifo' });
 
 // ---------------------------------------------------------------------------
 // Agent selection
@@ -128,21 +140,29 @@ function selectAgent(url: string, hostOverride: string): http.Agent | https.Agen
 const RETRY_CONFIG: RetryConfig = {
   maxRetries:        2,   // M3U8 / generic
   segmentMaxRetries: 1,   // TS segments — one retry only; stale URLs won't improve
-  initialDelay:      25,
-  maxDelay:          300,
+  initialDelay:      20,  // faster first retry
+  maxDelay:          200,
   backoffMultiplier: 2,
 };
 
-const TIMEOUT_MS         = 15000; // M3U8 / MPD / generic — time-to-first-byte (TTFB) only
-const SEGMENT_TIMEOUT_MS =  8000; // TS / fMP4 TTFB — once streaming begins the stall timeout takes over
-const MP4_TIMEOUT_MS     = 30000; // MP4 TTFB — large files may take a moment to start
+const TIMEOUT_MS         = 12000; // M3U8 / MPD / generic — TTFB (tightened from 15 s)
+const SEGMENT_TIMEOUT_MS =  6000; // TS / fMP4 TTFB — CDNs should respond in <6 s
+const MP4_TIMEOUT_MS     = 25000; // MP4 TTFB
 
-// After headers arrive, the TTFB timeout is replaced by a per-chunk idle/stall
-// timeout. This allows arbitrarily large or slow streams to complete while still
-// killing connections that have genuinely gone silent mid-transfer.
-const SEGMENT_STALL_MS   = 45000; // 45 s idle → stalled TS/fMP4 segment (1080p can be 4-8 MB on slow CDNs)
-const MP4_STALL_MS       = 60000; // 60 s idle → stalled MP4
-const DEFAULT_STALL_MS   = 30000; // generic fetch stall
+// Per-chunk stall timeouts (post-TTFB)
+const SEGMENT_STALL_MS   = 40000; // 1080p segments can be 4-8 MB on slow CDNs
+const MP4_STALL_MS       = 60000; // progressive MP4 stall
+const DEFAULT_STALL_MS   = 25000; // generic
+
+// Pipe highWaterMark: larger buffer reduces back-pressure stalls for high-bitrate streams.
+const HWM_HIGH = 256 * 1024; // 256 KB for 1080p+
+const HWM_LOW  =  64 * 1024; // 64 KB for 720p and below
+
+// Bandwidth threshold (bps) above which we treat a segment as high quality
+const HIGH_QUALITY_BPS = 1_200_000; // >= 720p
+
+// Deduplicated in-flight segment requests (prevents duplicate CDN fetches for the same segment)
+const pendingSegments = new Map<string, Promise<ExtendedResponse>>();
 
 // ---------------------------------------------------------------------------
 // Quality / bandwidth detection helpers
@@ -166,17 +186,40 @@ function bandwidthToQuality(bps: number): string {
 }
 
 // Detects fMP4 segment MIME type by URL extension.
+// NOTE: Many CDNs disguise TS segments with fake extensions (.html, .js, .css,
+// .png, .webp, .ico, .txt, .jpg) to evade hotlink scrapers.  Those all fall
+// through to the 'video/MP2T' default — which is intentional.
 function segmentContentType(url: string): string {
-  if (/\.mp4(\?|$)/i.test(url) || /\.m4s(\?|$)/i.test(url) || /\.m4v(\?|$)/i.test(url)) {
-    return 'video/mp4';
-  }
-  if (/\.aac(\?|$)/i.test(url) || /\.m4a(\?|$)/i.test(url)) {
-    return 'audio/mp4';
-  }
-  if (/\.vtt(\?|$)/i.test(url)) return 'text/vtt';
-  if (/\.webm(\?|$)/i.test(url)) return 'video/webm';
-  return 'video/MP2T'; // default: MPEG-TS
+  // Strip query string before matching
+  const path = url.split('?')[0].toLowerCase();
+
+  if (/\.(mp4|m4s|m4v)$/.test(path)) return 'video/mp4';
+  if (/\.(aac|m4a)$/.test(path))     return 'audio/mp4';
+  if (/\.vtt$/.test(path))           return 'text/vtt';
+  if (/\.webm$/.test(path))          return 'video/webm';
+  if (/\.ts$/.test(path))            return 'video/MP2T';
+
+  // .html / .js / .css / .png / .jpg / .webp / .ico / .txt / etc.
+  // → these are disguised TS segments; always treat as MPEG-TS.
+  return 'video/MP2T';
 }
+
+// Content-types that upstream servers assign to fake-extension segments.
+// We must NEVER forward these to the player — always override with derivedType.
+const UPSTREAM_FAKE_CONTENT_TYPES = new Set<string>([
+  'text/html',
+  'text/plain',
+  'text/css',
+  'text/javascript',
+  'application/javascript',
+  'application/x-javascript',
+  'application/json',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/x-icon',
+  'image/vnd.microsoft.icon',
+]);
 
 // ---------------------------------------------------------------------------
 // Anti-bot: rotating User-Agents and Accept-Language variants
@@ -387,14 +430,22 @@ async function _fetchWithRetryCore(
         signal: attemptController.signal,
       }) as ExtendedResponse;
 
-      // Headers arrived — remove the one-shot caller-abort listener and re-wire
-      // client disconnect to also clear the still-running body timeout.
+      // ── Critical: remove the one-shot abort relay BEFORE re-wiring ──────
+      // If callerSignal fires between `await fetch` resolving and the new
+      // addEventListener call, the old onCallerAbort would call
+      // attemptController.abort() on an already-settled signal, producing an
+      // unhandled AbortError that crashes the process. Remove it first.
       callerSignal?.removeEventListener('abort', onCallerAbort);
-      if (callerSignal) {
+
+      if (callerSignal && !callerSignal.aborted) {
         callerSignal.addEventListener('abort', () => {
           clearTimeout(timeoutId);
           attemptController.abort();
         }, { once: true });
+      } else if (callerSignal?.aborted) {
+        // Caller disconnected while headers were arriving — clean up and bail
+        clearTimeout(timeoutId);
+        throw Object.assign(new Error('Request aborted by caller'), { name: 'AbortError' });
       }
 
       if (response.ok || (response.status >= 400 && response.status < 500 && response.status !== 429)) {
@@ -412,10 +463,14 @@ async function _fetchWithRetryCore(
       callerSignal?.removeEventListener('abort', onCallerAbort);
 
       lastError = error as Error;
-      logger.warn(`⚠️  Attempt ${attempt + 1} failed: ${lastError.message}`);
 
-      if (callerSignal?.aborted) break;
-      if (lastError.name === 'AbortError') break;
+      // Client disconnected — this is normal, not an error worth logging
+      const isAbort = lastError.name === 'AbortError' || (lastError as NodeJS.ErrnoException).code === 'ABORT_ERR';
+      if (!isAbort) {
+        logger.warn(`⚠️  Attempt ${attempt + 1} failed: ${lastError.message}`);
+      }
+
+      if (callerSignal?.aborted || isAbort) break;
     }
 
     if (attempt < retries) {
@@ -480,13 +535,11 @@ function streamResponse(
   res: Response,
   abortController: InstanceType<typeof AbortController>,
   stallTimeoutMs = DEFAULT_STALL_MS,
+  highWaterMark = HWM_LOW,
 ): void {
   const body = upstreamResponse.body as unknown as Readable;
 
   // ── Phase 1 complete: TTFB timeout is no longer needed ──────────────────
-  // The TTFB timer was set in _fetchWithRetryCore to abort stalled connections
-  // before headers arrived. Headers are here now — clear it immediately.
-  // Leaving it running is the root cause of ERR_INCOMPLETE_CHUNKED_ENCODING.
   clearTimeout(upstreamResponse._bodyTimeoutId);
 
   // ── Phase 2: per-chunk idle / stall timeout ──────────────────────────────
@@ -505,9 +558,9 @@ function streamResponse(
     clearTimeout(stallTimer);
   }
 
-  scheduleStall(); // arm immediately when streaming begins
+  scheduleStall();
 
-  body?.on('data',  scheduleStall); // reset the clock on every chunk
+  body?.on('data',  scheduleStall);
   body?.on('end',   cancelStall);
   body?.on('error', cancelStall);
 
@@ -519,21 +572,25 @@ function streamResponse(
 
   body?.on('error', (err: NodeJS.ErrnoException) => {
     cancelStall();
-    // AbortError means the client disconnected or we intentionally aborted —
-    // either way the response is already gone so there is nothing to do.
     if (err.name === 'AbortError' || err.code === 'ABORT_ERR') return;
     logger.error('❌ Upstream stream error:', err.message);
     if (!res.headersSent) {
       res.status(502).json({ error: 'Stream error', message: err.message });
     } else {
-      // Use res.destroy() — NOT res.end() — for mid-stream binary errors.
-      // res.end() would send a clean HTTP close, making the player think it
-      // received a complete valid segment. res.destroy() issues a TCP RST.
       res.destroy();
     }
   });
 
-  body?.pipe(res);
+  // Apply highWaterMark to the socket writableHighWaterMark if possible,
+  // improving throughput for large 1080p segments.
+  if (highWaterMark > HWM_LOW) {
+    try {
+      const sock = (res as unknown as { socket?: { writableHighWaterMark?: number } }).socket;
+      if (sock) sock.writableHighWaterMark = highWaterMark;
+    } catch { /* non-critical */ }
+  }
+
+  body?.pipe(res, { end: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -559,20 +616,28 @@ function rewriteM3U8Content(
   }
 
   function endpointFor(resolvedUrl: string): string {
+    // Strip query string for extension matching
+    const path = resolvedUrl.split('?')[0].toLowerCase();
+
+    // Explicit playlist detection
     if (
-      /\.m3u8(\?|$)/i.test(resolvedUrl) ||
+      path.endsWith('.m3u8')                               ||
       /[?&]type=(video|audio|subtitle)(&|$)/i.test(resolvedUrl) ||
-      resolvedUrl.includes('/playlist/')  ||
-      resolvedUrl.includes('/master/')    ||
+      resolvedUrl.includes('/playlist/')                   ||
+      resolvedUrl.includes('/master/')                     ||
       resolvedUrl.includes('/index.m3u8')
     ) return '/m3u8-proxy';
+
+    // Fake-extension segments (.html, .js, .css, .png, .jpg, .webp, .ico, .txt, etc.)
+    // and real segment extensions (.ts, .mp4, .m4s, .aac …) all go to ts-proxy.
     return '/ts-proxy';
   }
 
   function proxyUrl(href: string): string {
     const resolved = abs(href);
     const ep = endpointFor(resolved);
-    return `${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}`;
+    const bwParam = (ep === '/ts-proxy' && currentVariantBw > 0) ? `&bw=${currentVariantBw}` : '';
+    return `${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}${bwParam}`;
   }
 
   function rewriteUriAttr(line: string, forcedEndpoint?: string): string {
@@ -587,6 +652,9 @@ function rewriteM3U8Content(
   const out: string[]   = [];
   let   expectVariantUrl = false;
 
+  // Track current variant bandwidth for segment URL annotation
+  let currentVariantBw = 0;
+
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
     const t   = raw.trim();
@@ -598,8 +666,8 @@ function rewriteM3U8Content(
     if (t.startsWith('#EXT-X-STREAM-INF')) {
       const bwMatch  = t.match(/BANDWIDTH=(\d+)/i);
       const resMatch = t.match(/RESOLUTION=(\d+x\d+)/i);
-      const bw       = bwMatch ? parseInt(bwMatch[1], 10) : 0;
-      logger.log(`  📊 Variant: ${resMatch ? resMatch[1] : '?'} — ${bandwidthToQuality(bw)} (${parseBandwidth(t)})`);
+      currentVariantBw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+      logger.log(`  📊 Variant: ${resMatch ? resMatch[1] : '?'} — ${bandwidthToQuality(currentVariantBw)} (${parseBandwidth(t)})`);
       out.push(raw);
       expectVariantUrl = true;
       continue;
@@ -673,6 +741,8 @@ async function handleM3U8(req: Request, res: Response, includeReferer: boolean):
     if (!includeReferer) { delete customHeaders['Referer']; delete customHeaders['referer']; }
 
     const requestHeaders = buildRequestHeaders(customHeaders, includeReferer);
+    // Allow gzip for text playlists — reduces bytes transferred significantly
+    requestHeaders['Accept-Encoding'] = 'gzip, deflate, br';
 
     if (hostOverride) {
       requestHeaders['Host'] = hostOverride;
@@ -688,25 +758,39 @@ async function handleM3U8(req: Request, res: Response, includeReferer: boolean):
 
     let m3u8Content = await targetResponse.text();
 
-    const isMaster = m3u8Content.includes('#EXT-X-STREAM-INF') || m3u8Content.includes('#EXT-X-I-FRAME-STREAM-INF');
-    if (isMaster) {
-      const variantCount = (m3u8Content.match(/#EXT-X-STREAM-INF/gi) || []).length;
-      logger.log(`  🎬 Master playlist — ${variantCount} quality variant(s)`);
-    } else {
-      const segCount = m3u8Content.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length;
-      const duration = (() => {
-        const m = m3u8Content.match(/#EXT-X-TARGETDURATION:(\d+)/i);
-        return m ? `${m[1]}s target duration` : '';
-      })();
-      logger.log(`  📼 Media playlist — ~${segCount} segment(s)${duration ? ', ' + duration : ''}`);
+    const isMaster  = m3u8Content.includes('#EXT-X-STREAM-INF') || m3u8Content.includes('#EXT-X-I-FRAME-STREAM-INF');
+    const isVOD     = m3u8Content.includes('#EXT-X-PLAYLIST-TYPE:VOD') || m3u8Content.includes('#EXT-X-ENDLIST');
+
+    if (IS_DEV) {
+      if (isMaster) {
+        const variantCount = (m3u8Content.match(/#EXT-X-STREAM-INF/gi) || []).length;
+        logger.log(`  🎬 Master playlist — ${variantCount} quality variant(s)`);
+      } else {
+        const segCount = m3u8Content.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length;
+        const duration = (() => { const m = m3u8Content.match(/#EXT-X-TARGETDURATION:(\d+)/i); return m ? `${m[1]}s target` : ''; })();
+        logger.log(`  📼 Media playlist — ~${segCount} segment(s)${duration ? ', ' + duration : ''} (${isVOD ? 'VOD' : 'LIVE'})`);
+      }
     }
 
-    const baseUrl    = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    const proxyBase  = `${req.protocol}://${req.get('host')}`;
+    const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+    const proxyBase = `${req.protocol}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride);
 
-    res.setHeader('Content-Type',  'application/vnd.apple.mpegurl');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+
+    // Cache-Control strategy:
+    //   Master playlist  → short cache (5 s). Players rarely re-fetch, but stale quality lists cause ABR issues.
+    //   VOD media playlist → moderate cache (30 s). Segment list is fixed but players poll for seek.
+    //   Live media playlist → no-cache. Player polls every target-duration; stale = buffering.
+    if (isMaster) {
+      res.setHeader('Cache-Control', 'public, max-age=5, stale-while-revalidate=5');
+    } else if (isVOD) {
+      res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+    } else {
+      res.setHeader('Cache-Control', 'no-cache, no-store');
+      res.setHeader('Pragma', 'no-cache');
+    }
+
     res.send(m3u8Content);
 
   } catch (err) {
@@ -751,6 +835,9 @@ async function handleFetch(req: Request, res: Response, includeReferer: boolean)
     res.setHeader('X-Upstream-Status',  targetResponse.status);
     if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
 
+    // Generic fetch (usually encryption keys or manifests) — short cache only
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
+
     forwardResponseHeaders(targetResponse, res);
     streamResponse(targetResponse, res, clientController, DEFAULT_STALL_MS);
 
@@ -787,78 +874,124 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
 
   const hostOverride = ((req.query.host as string) || '').trim();
 
+  // Detect quality hint from query param (set by rewriteM3U8Content when available)
+  const bwHint    = parseInt((req.query.bw as string) || '0', 10);
+  const isHighQ   = bwHint >= HIGH_QUALITY_BPS || /\.m4s(\?|$)/i.test(targetUrl) || /\.mp4(\?|$)/i.test(targetUrl);
+  const hwm       = isHighQ ? HWM_HIGH : HWM_LOW;
+  const stallMs   = isHighQ ? SEGMENT_STALL_MS : Math.min(SEGMENT_STALL_MS, 25000);
+
   const clientController = new AbortController();
   req.on('close', () => clientController.abort());
 
   try {
     const customHeaders  = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
+    // Binary segments: no compression — avoids decompression overhead and Content-Length mismatch.
+    // Also strip unnecessary browser-hint headers — CDNs don't care and it reduces request size.
+    requestHeaders['Accept-Encoding'] = 'identity';
+    delete requestHeaders['sec-ch-ua'];
+    delete requestHeaders['sec-ch-ua-mobile'];
+    delete requestHeaders['sec-ch-ua-platform'];
+    delete requestHeaders['Sec-Fetch-Dest'];
+    delete requestHeaders['Sec-Fetch-Mode'];
+    delete requestHeaders['Sec-Fetch-Site'];
 
-    if (hostOverride) {
-      requestHeaders['Host'] = hostOverride;
-    }
+    if (hostOverride) requestHeaders['Host'] = hostOverride;
 
     const rangeHeader = req.get('Range');
     if (rangeHeader) requestHeaders['Range'] = rangeHeader;
 
-    const MAX_SEGMENT_RETRIES = 3;
-    let targetResponse: ExtendedResponse | undefined;
-    let lastErr: Error | undefined;
+    // ── Segment deduplication ──────────────────────────────────────────────
+    // Two players requesting the same segment simultaneously (e.g. during ABR probing)
+    // would normally hit the CDN twice. We coalesce them into a single upstream fetch.
+    // Note: only safe for non-range requests (range requests are byte-specific).
+    const dedupKey = rangeHeader ? null : `${targetUrl}:${hostOverride}`;
+    let fetchPromise: Promise<ExtendedResponse>;
 
-    for (let attempt = 1; attempt <= MAX_SEGMENT_RETRIES; attempt++) {
-      if (clientController.signal.aborted) return;
+    if (dedupKey && pendingSegments.has(dedupKey)) {
+      fetchPromise = pendingSegments.get(dedupKey)!;
+    } else {
+      fetchPromise = _fetchWithRetryCore(
+        targetUrl,
+        { headers: requestHeaders, signal: clientController.signal },
+        RETRY_CONFIG.segmentMaxRetries,
+        SEGMENT_TIMEOUT_MS,
+      );
 
-      try {
-        targetResponse = await _fetchWithRetryCore(
-          targetUrl,
-          { headers: requestHeaders, signal: clientController.signal, compress: true },
-          0,
-          SEGMENT_TIMEOUT_MS
-        );
-        lastErr = undefined;
-        break;
-      } catch (err) {
-        if ((err as Error).name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR') return;
-        lastErr = err as Error;
-        logger.warn(`⚠️  Segment attempt ${attempt}/${MAX_SEGMENT_RETRIES} failed: ${lastErr.message} — ${targetUrl}`);
-        if (attempt < MAX_SEGMENT_RETRIES) {
-          await new Promise(r => setTimeout(r, 250 * attempt));
-        }
+      if (dedupKey) {
+        pendingSegments.set(dedupKey, fetchPromise);
+        fetchPromise.finally(() => pendingSegments.delete(dedupKey));
       }
     }
 
-    if (lastErr || !targetResponse) {
-      logger.error('❌ Segment all retries exhausted:', lastErr?.message);
-      if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: lastErr?.message, type: lastErr?.name });
+    let targetResponse: ExtendedResponse;
+    try {
+      targetResponse = await fetchPromise;
+    } catch (err) {
+      if ((err as Error).name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR') return;
+      // Single retry with a short delay on network errors
+      if (!clientController.signal.aborted) {
+        await new Promise(r => setTimeout(r, 200));
+        try {
+          targetResponse = await _fetchWithRetryCore(
+            targetUrl,
+            { headers: requestHeaders, signal: clientController.signal },
+            0,
+            SEGMENT_TIMEOUT_MS,
+          );
+        } catch (retryErr) {
+          if ((retryErr as Error).name === 'AbortError' || (retryErr as NodeJS.ErrnoException).code === 'ABORT_ERR') return;
+          logger.error('❌ Segment all retries exhausted:', (retryErr as Error).message);
+          if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: (retryErr as Error).message });
+          return;
+        }
+      } else { return; }
+    }
+
+    if (!targetResponse!.ok && targetResponse!.status !== 206) {
+      logger.error('❌ Segment fetch failed:', targetResponse!.status, targetUrl);
+      res.status(targetResponse!.status).json({ error: 'Failed to fetch segment', status: targetResponse!.status });
       return;
     }
 
-    if (!targetResponse.ok && targetResponse.status !== 206) {
-      logger.error('❌ Segment fetch failed:', targetResponse.status, targetUrl);
-      res.status(targetResponse.status).json({ error: 'Failed to fetch segment', status: targetResponse.status });
-      return;
-    }
+    const upstreamType   = (targetResponse!.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const derivedType    = segmentContentType(targetUrl);
 
-    const upstreamType  = targetResponse.headers.get('content-type') || '';
-    const derivedType   = segmentContentType(targetUrl);
-    const contentType   = (derivedType !== 'video/MP2T')
-      ? derivedType
-      : (upstreamType && upstreamType !== 'application/octet-stream' && upstreamType !== 'text/javascript')
-        ? upstreamType
-        : derivedType;
-    const contentLength = targetResponse.headers.get('content-length');
-    const contentRange  = targetResponse.headers.get('content-range');
-    const isRangeResponse = targetResponse.status === 206;
+    // Always trust derivedType when:
+    //   1. It resolved to a specific known format (mp4, aac, vtt, webm), OR
+    //   2. Upstream returned a fake/text content-type (disguised segment CDN trick)
+    // Only fall back to upstream type when derivedType is the generic TS default
+    // AND upstream looks like a real binary media type.
+    const contentType =
+      (derivedType !== 'video/MP2T')
+        ? derivedType
+        : (upstreamType && !UPSTREAM_FAKE_CONTENT_TYPES.has(upstreamType) && upstreamType !== 'application/octet-stream')
+          ? upstreamType
+          : derivedType;
+    const contentLength  = targetResponse!.headers.get('content-length');
+    const contentRange   = targetResponse!.headers.get('content-range');
+    const isRangeResp    = targetResponse!.status === 206;
 
-    res.status(targetResponse.status);
+    res.status(targetResponse!.status);
     res.setHeader('Content-Type',      contentType);
     res.setHeader('Accept-Ranges',     'bytes');
-    res.setHeader('X-Upstream-Status', targetResponse.status);
-    if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
-    if (contentRange)  res.setHeader('Content-Range',  contentRange);
+    res.setHeader('X-Upstream-Status', targetResponse!.status);
+    if (isRangeResp && contentLength) res.setHeader('Content-Length', contentLength);
+    if (contentRange) res.setHeader('Content-Range', contentRange);
 
-    forwardResponseHeaders(targetResponse, res);
-    streamResponse(targetResponse, res, clientController, SEGMENT_STALL_MS);
+    // ── Cache-Control for segments ─────────────────────────────────────────
+    // Segments are content-addressed (URL encodes sequence number / timestamp).
+    // They are immutable once published — aggressive caching is safe and fast.
+    // CDN edge + browser both benefit from 1 h cache.
+    if (!rangeHeader) {
+      res.setHeader('Cache-Control', 'public, max-age=3600, immutable');
+    } else {
+      // Range requests: still cache but omit immutable so the client can re-range
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    }
+
+    forwardResponseHeaders(targetResponse!, res);
+    streamResponse(targetResponse!, res, clientController, stallMs, hwm);
 
   } catch (err) {
     if ((err as Error).name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR') return;
@@ -917,8 +1050,12 @@ app.get('/mp4-proxy', async (req: Request, res: Response) => {
     if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
     if (contentRange)  res.setHeader('Content-Range',  contentRange);
 
+    // MP4: cache aggressively. Range requests are fine to cache — the URL is
+    // stable and the byte range is part of the response headers.
+    res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=300');
+
     forwardResponseHeaders(targetResponse, res);
-    streamResponse(targetResponse, res, clientController, MP4_STALL_MS);
+    streamResponse(targetResponse, res, clientController, MP4_STALL_MS, HWM_HIGH);
 
   } catch (err) {
     if ((err as Error).name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR') return;
@@ -953,6 +1090,8 @@ app.get('/subtitle', async (req: Request, res: Response) => {
     if (!entries || entries.length === 0) { res.status(415).json({ error: 'Unsupported subtitle format or failed to parse.' }); return; }
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    // Subtitles are static per episode — 5 min cache is safe and avoids re-fetching on seek
+    res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
     res.send(entriesToSRT(entries));
 
   } catch (err) {
