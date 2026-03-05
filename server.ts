@@ -150,8 +150,8 @@ const RETRY_CONFIG: RetryConfig = {
   backoffMultiplier: 2,
 };
 
-const TIMEOUT_MS         = 12000; // M3U8 / MPD / generic — TTFB (tightened from 15 s)
-const SEGMENT_TIMEOUT_MS =  6000; // TS / fMP4 TTFB — CDNs should respond in <6 s
+const TIMEOUT_MS         = 12000; // M3U8 / MPD / generic — TTFB
+const SEGMENT_TIMEOUT_MS = 20000; // TS / fMP4 TTFB — 20 s: 1080p segments on slow/distant CDNs can take 10–15 s
 const MP4_TIMEOUT_MS     = 25000; // MP4 TTFB
 
 // Per-chunk stall timeouts (post-TTFB)
@@ -475,7 +475,12 @@ async function _fetchWithRetryCore(
         logger.warn(`⚠️  Attempt ${attempt + 1} failed: ${lastError.message}`);
       }
 
-      if (callerSignal?.aborted || isAbort) break;
+      // ONLY break when the CALLER (client) disconnected.
+      // Do NOT break on a generic isAbort — that also matches our own internal
+      // TTFB timeout firing, which would silently kill the retry loop even though
+      // the client is still connected. The callerSignal check is the authoritative
+      // guard for "client is gone".
+      if (callerSignal?.aborted) break;
     }
 
     if (attempt < retries) {
@@ -933,7 +938,10 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
     try {
       targetResponse = await fetchPromise;
     } catch (err) {
-      if ((err as Error).name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR') return;
+      // Only silently return for a genuine client disconnect.
+      // An AbortError where the client is still connected means our internal
+      // TTFB timeout fired — fall through to retry logic below.
+      if (((err as Error).name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR') && clientController.signal.aborted) return;
       // Single retry with a short delay on network errors
       if (!clientController.signal.aborted) {
         await new Promise(r => setTimeout(r, 200));
@@ -945,7 +953,7 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
             SEGMENT_TIMEOUT_MS,
           );
         } catch (retryErr) {
-          if ((retryErr as Error).name === 'AbortError' || (retryErr as NodeJS.ErrnoException).code === 'ABORT_ERR') return;
+          if (((retryErr as Error).name === 'AbortError' || (retryErr as NodeJS.ErrnoException).code === 'ABORT_ERR') && clientController.signal.aborted) return;
           logger.error('❌ Segment all retries exhausted:', (retryErr as Error).message);
           if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: (retryErr as Error).message });
           return;
