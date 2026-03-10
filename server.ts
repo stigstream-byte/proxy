@@ -99,43 +99,39 @@ app.set('json escape', false);
 
 // Keep-alive agents — LIFO scheduling reuses warm connections aggressively,
 // cutting TLS handshake overhead on high-QPS segment bursts.
-// maxSockets: 256 for heavy concurrent segment loads at 1080p (video + audio + subtitles).
-const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 64, scheduling: 'lifo' });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 64, scheduling: 'lifo' });
+// maxSockets: 512 for heavy concurrent segment loads at 1080p (video + audio + subtitles).
+// keepAliveMsecs: 60 s — prevents idle sockets from being evicted between segment bursts.
+const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 512, maxFreeSockets: 128, scheduling: 'lifo', keepAliveMsecs: 60000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 512, maxFreeSockets: 128, scheduling: 'lifo', keepAliveMsecs: 60000 });
+
+// ── Host-override agent cache ────────────────────────────────────────────────
+// The original code created a new one-shot agent (keepAlive: false) per request,
+// meaning a fresh TLS handshake every time — ~100–300 ms penalty each.
+// We now cache a keepAlive agent per hostOverride so TLS sessions are reused.
+const hostOverrideAgentCache = new Map<string, https.Agent>();
+const hostOverrideHttpAgentCache = new Map<string, http.Agent>();
+
+function getHostOverrideAgent(url: string, hostOverride: string): http.Agent | https.Agent {
+  const isHttps = url.startsWith('https');
+  const cache   = isHttps ? hostOverrideAgentCache : hostOverrideHttpAgentCache;
+
+  if (cache.has(hostOverride)) return cache.get(hostOverride)!;
+
+  const agent = isHttps
+    ? new https.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, servername: hostOverride, keepAliveMsecs: 60000 })
+    : new http.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, keepAliveMsecs: 60000 });
+
+  cache.set(hostOverride, agent as any);
+  return agent;
+}
 
 // ---------------------------------------------------------------------------
-// Agent selection
-// ---------------------------------------------------------------------------
-// When a Host override is in play the shared pool MUST NOT be used because:
-//   1. TLS SNI — the shared httpsAgent derives servername from the URL hostname.
-//      If the real vhost differs (e.g. hitting a CDN IP), the TLS handshake
-//      fails or returns the wrong certificate.
-//   2. Pool contamination — a bad/mismatched connection stored in the shared
-//      pool gets re-used for normal requests, causing intermittent failures
-//      across ALL endpoints even when no host override is set.
-//
-// The fix: for host-override HTTPS requests, create a short-lived agent with
-// the correct servername and keepAlive disabled so it never touches the pool.
+// Agent selection — uses cached keepAlive agents for host overrides
 // ---------------------------------------------------------------------------
 
 function selectAgent(url: string, hostOverride: string): http.Agent | https.Agent {
-  const isHttps = url.startsWith('https');
-
-  if (hostOverride && isHttps) {
-    // Fresh one-shot agent: correct SNI servername, never pooled.
-    return new https.Agent({
-      keepAlive:  false,
-      servername: hostOverride, // TLS SNI matches the virtual host, not the URL IP
-    });
-  }
-
-  if (hostOverride) {
-    // HTTP with host override — isolated pool keyed to this override only,
-    // so it can't contaminate the shared httpAgent pool.
-    return new http.Agent({ keepAlive: false });
-  }
-
-  return isHttps ? httpsAgent : httpAgent;
+  if (hostOverride) return getHostOverrideAgent(url, hostOverride);
+  return url.startsWith('https') ? httpsAgent : httpAgent;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,27 +140,35 @@ function selectAgent(url: string, hostOverride: string): http.Agent | https.Agen
 
 const RETRY_CONFIG: RetryConfig = {
   maxRetries:        2,   // M3U8 / generic
-  segmentMaxRetries: 1,   // TS segments — one retry only; stale URLs won't improve
-  initialDelay:      20,  // faster first retry
-  maxDelay:          200,
+  segmentMaxRetries: 1,   // TS segments — hedged fetch makes extra retries mostly unnecessary
+  initialDelay:      0,   // no delay — hedging already overlaps the retry
+  maxDelay:          50,
   backoffMultiplier: 2,
 };
 
-const TIMEOUT_MS         = 12000; // M3U8 / MPD / generic — TTFB
-const SEGMENT_TIMEOUT_MS = 20000; // TS / fMP4 TTFB — 20 s: 1080p segments on slow/distant CDNs can take 10–15 s
-const MP4_TIMEOUT_MS     = 25000; // MP4 TTFB
+const TIMEOUT_MS         = 10000; // M3U8 / MPD / generic — TTFB
+const SEGMENT_TIMEOUT_MS =  5000; // TS / fMP4 TTFB — cut from 20s: if CDN hasn't sent headers
+                                   // in 5 s the hedge has already fired a parallel attempt anyway
+const MP4_TIMEOUT_MS     = 15000; // MP4 TTFB
 
 // Per-chunk stall timeouts (post-TTFB)
-const SEGMENT_STALL_MS   = 40000; // 1080p segments can be 4-8 MB on slow CDNs
-const MP4_STALL_MS       = 60000; // progressive MP4 stall
-const DEFAULT_STALL_MS   = 25000; // generic
+const SEGMENT_STALL_MS   = 15000; // cut from 40 s — stalled connections don't recover
+const MP4_STALL_MS       = 45000; // progressive MP4 stall
+const DEFAULT_STALL_MS   = 15000; // generic
 
 // Pipe highWaterMark: larger buffer reduces back-pressure stalls for high-bitrate streams.
-const HWM_HIGH = 256 * 1024; // 256 KB for 1080p+
-const HWM_LOW  =  64 * 1024; // 64 KB for 720p and below
+const HWM_HIGH = 512 * 1024; // 512 KB for 1080p+ (was 256 KB)
+const HWM_LOW  = 128 * 1024; // 128 KB for 720p and below (was 64 KB)
 
 // Bandwidth threshold (bps) above which we treat a segment as high quality
 const HIGH_QUALITY_BPS = 1_200_000; // >= 720p
+
+// ── Hedged fetch config ───────────────────────────────────────────────────────
+// If a segment request hasn't returned headers within HEDGE_AFTER_MS, we fire
+// a second identical request in parallel and race them.  Whichever wins gets
+// streamed; the loser is aborted.  This eliminates "slow CDN node" tail latency
+// without burning extra bandwidth on the fast path (most segments win in <500 ms).
+const HEDGE_AFTER_MS = 500; // fire second attempt after 500 ms of TTFB silence
 
 // Deduplicated in-flight segment requests (prevents duplicate CDN fetches for the same segment)
 const pendingSegments = new Map<string, Promise<ExtendedResponse>>();
@@ -529,6 +533,109 @@ async function fetchWithRetry(
 }
 
 // ---------------------------------------------------------------------------
+// Hedged segment fetch
+// ---------------------------------------------------------------------------
+// Fires request #1 immediately.  If no headers arrive within HEDGE_AFTER_MS,
+// fires request #2 in parallel.  Whichever returns headers first wins — the
+// loser is aborted.  This eliminates slow-CDN-node tail latency without any
+// extra cost on the fast path (hedge timer is cancelled on an early win).
+//
+// This is the primary reason fast proxies appear to respond in <100 ms even
+// for 1080p segments: they're not waiting — they're racing.
+// ---------------------------------------------------------------------------
+
+async function hedgedSegmentFetch(
+  url: string,
+  options: RequestInit & { headers?: Record<string, string> },
+  callerSignal: AbortController['signal'] | undefined,
+  timeoutMs: number,
+  hedgeAfterMs: number,
+): Promise<ExtendedResponse> {
+
+  return new Promise<ExtendedResponse>((resolve, reject) => {
+    let settled = false;
+    let hedgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const controllers: AbortController[] = [];
+
+    function settle(winner: ExtendedResponse, losers: AbortController[]): void {
+      if (settled) return;
+      settled = true;
+      if (hedgeTimer) clearTimeout(hedgeTimer);
+      for (const c of losers) {
+        try { c.abort(); } catch { /* ignore */ }
+      }
+      resolve(winner);
+    }
+
+    function fail(err: unknown): void {
+      if (settled) return;
+      settled = true;
+      if (hedgeTimer) clearTimeout(hedgeTimer);
+      for (const c of controllers) {
+        try { c.abort(); } catch { /* ignore */ }
+      }
+      reject(err);
+    }
+
+    // Abort all attempts if the client disconnects
+    if (callerSignal) {
+      callerSignal.addEventListener('abort', () => fail(Object.assign(new Error('Aborted'), { name: 'AbortError' })), { once: true });
+    }
+
+    function launchAttempt(isHedge: boolean): void {
+      if (settled) return;
+
+      const controller = new AbortController();
+      controllers.push(controller);
+
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+        // If this is the primary and the hedge hasn't fired yet, fire it now immediately
+        if (!isHedge && !settled) launchAttempt(true);
+      }, timeoutMs);
+
+      const agent = selectAgent(url, (options.headers?.['Host']) ?? '');
+
+      fetch(url, { ...options, agent, signal: controller.signal } as any)
+        .then((response) => {
+          clearTimeout(timeoutId);
+          const allOthers = controllers.filter(c => c !== controller);
+          // Accept 2xx, 206, or any 4xx (those are content errors, not network errors)
+          if ((response as ExtendedResponse).ok || response.status === 206 || (response.status >= 400 && response.status < 500)) {
+            settle(response as ExtendedResponse, allOthers);
+          } else if (!isHedge && !settled) {
+            // Non-retriable bad status on primary — hedge immediately
+            launchAttempt(true);
+          } else {
+            fail(new Error(`HTTP ${response.status}`));
+          }
+        })
+        .catch((err: Error) => {
+          clearTimeout(timeoutId);
+          const isAbort = err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR';
+          if (isAbort && (callerSignal?.aborted || settled)) return; // expected
+          if (!isHedge && !settled) {
+            // Primary failed — fire hedge immediately instead of waiting
+            launchAttempt(true);
+          } else if (!settled) {
+            fail(err);
+          }
+        });
+    }
+
+    // Fire primary immediately
+    launchAttempt(false);
+
+    // Schedule hedge after HEDGE_AFTER_MS if primary hasn't won yet
+    hedgeTimer = setTimeout(() => {
+      hedgeTimer = null;
+      launchAttempt(true);
+    }, hedgeAfterMs);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Stream helper
 // ---------------------------------------------------------------------------
 
@@ -551,6 +658,18 @@ function streamResponse(
 
   // ── Phase 1 complete: TTFB timeout is no longer needed ──────────────────
   clearTimeout(upstreamResponse._bodyTimeoutId);
+
+  // ── Disable Nagle's algorithm on the client socket ───────────────────────
+  // Without this, the OS batches small writes (headers + first chunk) and
+  // delays them up to 200 ms.  setNoDelay(true) flushes immediately, so the
+  // client sees the first byte as soon as the upstream delivers it.
+  try {
+    const sock = (res as unknown as { socket?: import('net').Socket }).socket;
+    if (sock) {
+      sock.setNoDelay(true);
+      sock.setKeepAlive(true, 30000);
+    }
+  } catch { /* non-critical */ }
 
   // ── Phase 2: per-chunk idle / stall timeout ──────────────────────────────
   let stallTimer: ReturnType<typeof setTimeout>;
@@ -874,7 +993,7 @@ app.get('/health', (_req: Request, res: Response) => {
 // M3U8
 app.get('/m3u8-proxy', (req: Request, res: Response) => handleM3U8(req, res, true));
 
-// TS / segment proxy
+// TS / segment proxy — optimised with hedged parallel fetching
 app.get('/ts-proxy', async (req: Request, res: Response) => {
   const targetUrl = req.query.url as string | undefined;
   if (!targetUrl) { res.status(400).json({ error: 'Missing url parameter' }); return; }
@@ -884,11 +1003,11 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
 
   const hostOverride = ((req.query.host as string) || '').trim();
 
-  // Detect quality hint from query param (set by rewriteM3U8Content when available)
-  const bwHint    = parseInt((req.query.bw as string) || '0', 10);
-  const isHighQ   = bwHint >= HIGH_QUALITY_BPS || /\.m4s(\?|$)/i.test(targetUrl) || /\.mp4(\?|$)/i.test(targetUrl);
-  const hwm       = isHighQ ? HWM_HIGH : HWM_LOW;
-  const stallMs   = isHighQ ? SEGMENT_STALL_MS : Math.min(SEGMENT_STALL_MS, 25000);
+  // Quality / buffer tuning
+  const bwHint  = parseInt((req.query.bw as string) || '0', 10);
+  const isHighQ = bwHint >= HIGH_QUALITY_BPS || /\.m4s(\?|$)/i.test(targetUrl) || /\.mp4(\?|$)/i.test(targetUrl);
+  const hwm     = isHighQ ? HWM_HIGH : HWM_LOW;
+  const stallMs = SEGMENT_STALL_MS;
 
   const clientController = new AbortController();
   req.on('close', () => clientController.abort());
@@ -896,8 +1015,9 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
   try {
     const customHeaders  = parseCustomHeaders(req.query);
     const requestHeaders = buildRequestHeaders(customHeaders, true);
-    // Binary segments: no compression — avoids decompression overhead and Content-Length mismatch.
-    // Also strip unnecessary browser-hint headers — CDNs don't care and it reduces request size.
+
+    // Binary segments: no compression — avoids Content-Length mismatch.
+    // Strip browser-hint headers — CDNs ignore them and they waste bytes.
     requestHeaders['Accept-Encoding'] = 'identity';
     delete requestHeaders['sec-ch-ua'];
     delete requestHeaders['sec-ch-ua-mobile'];
@@ -912,20 +1032,25 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
     if (rangeHeader) requestHeaders['Range'] = rangeHeader;
 
     // ── Segment deduplication ──────────────────────────────────────────────
-    // Two players requesting the same segment simultaneously (e.g. during ABR probing)
-    // would normally hit the CDN twice. We coalesce them into a single upstream fetch.
-    // Note: only safe for non-range requests (range requests are byte-specific).
+    // Coalesce concurrent identical requests (ABR probing, multi-player) into
+    // one upstream fetch.  Range requests are byte-specific — never dedup.
     const dedupKey = rangeHeader ? null : `${targetUrl}:${hostOverride}`;
     let fetchPromise: Promise<ExtendedResponse>;
 
     if (dedupKey && pendingSegments.has(dedupKey)) {
       fetchPromise = pendingSegments.get(dedupKey)!;
     } else {
-      fetchPromise = _fetchWithRetryCore(
+      // ── Hedged fetch ──────────────────────────────────────────────────────
+      // Fire request #1 immediately.  If headers don't arrive within
+      // HEDGE_AFTER_MS, fire request #2 in parallel.  Whichever wins is used;
+      // the loser is aborted.  This eliminates slow-CDN-node tail latency
+      // without burning extra bandwidth on the fast path.
+      fetchPromise = hedgedSegmentFetch(
         targetUrl,
-        { headers: requestHeaders, signal: clientController.signal },
-        RETRY_CONFIG.segmentMaxRetries,
+        { method: 'GET', headers: requestHeaders },
+        clientController.signal,
         SEGMENT_TIMEOUT_MS,
+        HEDGE_AFTER_MS,
       );
 
       if (dedupKey) {
@@ -938,52 +1063,30 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
     try {
       targetResponse = await fetchPromise;
     } catch (err) {
-      // Only silently return for a genuine client disconnect.
-      // An AbortError where the client is still connected means our internal
-      // TTFB timeout fired — fall through to retry logic below.
       if (((err as Error).name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR') && clientController.signal.aborted) return;
-      // Single retry with a short delay on network errors
-      if (!clientController.signal.aborted) {
-        await new Promise(r => setTimeout(r, 200));
-        try {
-          targetResponse = await _fetchWithRetryCore(
-            targetUrl,
-            { headers: requestHeaders, signal: clientController.signal },
-            0,
-            SEGMENT_TIMEOUT_MS,
-          );
-        } catch (retryErr) {
-          if (((retryErr as Error).name === 'AbortError' || (retryErr as NodeJS.ErrnoException).code === 'ABORT_ERR') && clientController.signal.aborted) return;
-          logger.error('❌ Segment all retries exhausted:', (retryErr as Error).message);
-          if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: (retryErr as Error).message });
-          return;
-        }
-      } else { return; }
+      logger.error('❌ Segment fetch failed (all attempts):', (err as Error).message);
+      if (!res.headersSent) res.status(502).json({ error: 'Proxy error', message: (err as Error).message });
+      return;
     }
 
     if (!targetResponse!.ok && targetResponse!.status !== 206) {
-      logger.error('❌ Segment fetch failed:', targetResponse!.status, targetUrl);
+      logger.error('❌ Segment bad status:', targetResponse!.status, targetUrl);
       res.status(targetResponse!.status).json({ error: 'Failed to fetch segment', status: targetResponse!.status });
       return;
     }
 
-    const upstreamType   = (targetResponse!.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    const derivedType    = segmentContentType(targetUrl);
-
-    // Always trust derivedType when:
-    //   1. It resolved to a specific known format (mp4, aac, vtt, webm), OR
-    //   2. Upstream returned a fake/text content-type (disguised segment CDN trick)
-    // Only fall back to upstream type when derivedType is the generic TS default
-    // AND upstream looks like a real binary media type.
-    const contentType =
+    const upstreamType = (targetResponse!.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const derivedType  = segmentContentType(targetUrl);
+    const contentType  =
       (derivedType !== 'video/MP2T')
         ? derivedType
         : (upstreamType && !UPSTREAM_FAKE_CONTENT_TYPES.has(upstreamType) && upstreamType !== 'application/octet-stream')
           ? upstreamType
           : derivedType;
-    const contentLength  = targetResponse!.headers.get('content-length');
-    const contentRange   = targetResponse!.headers.get('content-range');
-    const isRangeResp    = targetResponse!.status === 206;
+
+    const contentLength = targetResponse!.headers.get('content-length');
+    const contentRange  = targetResponse!.headers.get('content-range');
+    const isRangeResp   = targetResponse!.status === 206;
 
     res.status(targetResponse!.status);
     res.setHeader('Content-Type',      contentType);
@@ -992,16 +1095,8 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
     if (isRangeResp && contentLength) res.setHeader('Content-Length', contentLength);
     if (contentRange) res.setHeader('Content-Range', contentRange);
 
-    // ── Cache-Control for segments ─────────────────────────────────────────
-    // Segments are content-addressed (URL encodes sequence number / timestamp).
-    // They are immutable once published — aggressive caching is safe and fast.
-    // CDN edge + browser both benefit from 1 h cache.
-    if (!rangeHeader) {
-      res.setHeader('Cache-Control', 'public, max-age=3600, immutable');
-    } else {
-      // Range requests: still cache but omit immutable so the client can re-range
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-    }
+    // Segments are content-addressed and immutable — aggressive caching is safe.
+    res.setHeader('Cache-Control', rangeHeader ? 'public, max-age=3600' : 'public, max-age=3600, immutable');
 
     forwardResponseHeaders(targetResponse!, res);
     streamResponse(targetResponse!, res, clientController, stallMs, hwm);
