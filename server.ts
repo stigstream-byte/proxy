@@ -902,7 +902,8 @@ async function handleM3U8(req: Request, res: Response, includeReferer: boolean):
     }
 
     const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-    const proxyBase = `https://${req.get('host')}`;
+    const proto    = req.get('x-forwarded-proto') || req.protocol;
+    const proxyBase = `${proto === 'https' ? 'https' : 'https'}://${req.get('host')}`;
     m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
