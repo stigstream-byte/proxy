@@ -111,6 +111,17 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 512, maxFreeSo
 const hostOverrideAgentCache = new Map<string, https.Agent>();
 const hostOverrideHttpAgentCache = new Map<string, http.Agent>();
 
+const AGENT_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+setInterval(() => {
+  httpAgent.destroy();
+  httpsAgent.destroy();
+  hostOverrideAgentCache.forEach(a => a.destroy());
+  hostOverrideAgentCache.clear();
+  hostOverrideHttpAgentCache.forEach(a => a.destroy());
+  hostOverrideHttpAgentCache.clear();
+  console.log('[agent-refresh] Stale keepAlive connections cleared');
+}, AGENT_REFRESH_INTERVAL_MS).unref();
+
 function getHostOverrideAgent(url: string, hostOverride: string): http.Agent | https.Agent {
   const isHttps = url.startsWith('https');
   const cache   = isHttps ? hostOverrideAgentCache : hostOverrideHttpAgentCache;
@@ -1056,7 +1067,7 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
 
       if (dedupKey) {
         pendingSegments.set(dedupKey, fetchPromise);
-        fetchPromise.finally(() => pendingSegments.delete(dedupKey));
+        fetchPromise.catch(() => {}).finally(() => pendingSegments.delete(dedupKey));
       }
     }
 
