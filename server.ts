@@ -6,6 +6,7 @@ import * as dotenv from 'dotenv';
 dotenv.config(); // Load .env before anything else reads process.env
 
 import express, { Request, Response, NextFunction } from 'express';
+import * as crypto from 'crypto';
 import { notFoundHandler } from './src/middleware/notFound';
 import fetch, { Response as FetchResponse, RequestInit } from 'node-fetch';
 import * as http from 'http';
@@ -291,6 +292,66 @@ const BLOCKED_RESPONSE_HEADERS = new Set<string>([
   'x-upstream-status',
   'transfer-encoding',
 ]);
+
+// ---------------------------------------------------------------------------
+// Param encryption / decryption (AES-256-CBC — matches proxyEncrypt.js)
+// ---------------------------------------------------------------------------
+
+const ENCRYPT_ALGORITHM = 'aes-256-cbc';
+
+function _getEncryptKey(): Buffer {
+  const hex = process.env.PROXY_ENCRYPT_KEY || 'a'.repeat(64); // fallback = dev only
+  if (hex.length !== 64) throw new Error('PROXY_ENCRYPT_KEY must be 64 hex chars (32 bytes)');
+  return Buffer.from(hex, 'hex');
+}
+
+/**
+ * Encrypt a plaintext string → IV-prefixed hex (matches proxyEncrypt.js encryptValue).
+ * First 32 hex chars = IV, rest = ciphertext.
+ */
+function encryptParam(plaintext: string): string {
+  const key    = _getEncryptKey();
+  const iv     = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ENCRYPT_ALGORITHM, key, iv);
+  const enc    = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  return iv.toString('hex') + enc.toString('hex');
+}
+
+/**
+ * Decrypt an IV-prefixed hex string produced by encryptParam / proxyEncrypt.js.
+ */
+function decryptParam(hex: string): string {
+  const key      = _getEncryptKey();
+  const iv       = Buffer.from(hex.slice(0, 32), 'hex');
+  const ct       = Buffer.from(hex.slice(32), 'hex');
+  const decipher = crypto.createDecipheriv(ENCRYPT_ALGORITHM, key, iv);
+  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
+}
+
+// ---------------------------------------------------------------------------
+// Decrypt middleware — runs before every route
+// When &encrypted=true is present, decrypts `url` and `headers` in req.query
+// so all downstream handlers see plain values as if encryption never happened.
+// ---------------------------------------------------------------------------
+
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  if (req.query.encrypted !== 'true') return next();
+
+  try {
+    if (typeof req.query.url === 'string') {
+      (req.query as Record<string, unknown>).url = decryptParam(req.query.url);
+    }
+    if (typeof req.query.headers === 'string') {
+      (req.query as Record<string, unknown>).headers = decryptParam(req.query.headers);
+    }
+    delete (req.query as Record<string, unknown>).encrypted;
+  } catch (err) {
+    logger.warn('✗ Failed to decrypt query params:', (err as Error).message);
+    // Let it fall through — downstream validators will reject the garbled URL
+  }
+
+  next();
+});
 
 // ---------------------------------------------------------------------------
 // CORS middleware
@@ -744,12 +805,23 @@ function rewriteM3U8Content(
   customHeaders: Record<string, string> = {},
   hostOverride = '',
 ): string {
-  const headersParam = Object.keys(customHeaders).length > 0
-    ? `&headers=${encodeURIComponent(JSON.stringify(customHeaders))}`
+  const rawHeadersJson = Object.keys(customHeaders).length > 0
+    ? JSON.stringify(customHeaders)
     : '';
 
   const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
-  const suffix = headersParam + hostParam;
+
+  /**
+   * Build a proxied URL with encrypted `url` (and `headers`) values.
+   * host is left in plaintext — it's not sensitive and the worker needs it unmodified.
+   */
+  function buildProxiedUrl(resolvedUrl: string, ep: string, extra = ''): string {
+    const encUrl     = encryptParam(resolvedUrl);
+    let   params     = `url=${encUrl}&encrypted=true`;
+    if (rawHeadersJson) params += `&headers=${encryptParam(rawHeadersJson)}`;
+    if (hostOverride)   params += hostParam;
+    return `${proxyBaseUrl}${ep}?${params}${extra}`;
+  }
 
   function abs(href: string): string {
     try { return new URL(href, baseUrl).href; } catch { return href; }
@@ -775,16 +847,16 @@ function rewriteM3U8Content(
 
   function proxyUrl(href: string): string {
     const resolved = abs(href);
-    const ep = endpointFor(resolved);
-    const bwParam = (ep === '/ts-proxy' && currentVariantBw > 0) ? `&bw=${currentVariantBw}` : '';
-    return `${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}${bwParam}`;
+    const ep       = endpointFor(resolved);
+    const bwExtra  = (ep === '/ts-proxy' && currentVariantBw > 0) ? `&bw=${currentVariantBw}` : '';
+    return buildProxiedUrl(resolved, ep, bwExtra);
   }
 
   function rewriteUriAttr(line: string, forcedEndpoint?: string): string {
     return line.replace(/URI="([^"]+)"/gi, (_, href: string) => {
       const resolved = abs(href);
-      const ep = forcedEndpoint || endpointFor(resolved);
-      return `URI="${proxyBaseUrl}${ep}?url=${encodeURIComponent(resolved)}${suffix}"`;
+      const ep       = forcedEndpoint || endpointFor(resolved);
+      return `URI="${buildProxiedUrl(resolved, ep)}"`;
     });
   }
 
@@ -845,7 +917,7 @@ function rewriteM3U8Content(
     // ── URL lines (variant playlists or media segments) ───────────────────
 
     if (expectVariantUrl) {
-      out.push(`${proxyBaseUrl}/m3u8-proxy?url=${encodeURIComponent(abs(t))}${suffix}`);
+      out.push(buildProxiedUrl(abs(t), '/m3u8-proxy'));
       expectVariantUrl = false;
       continue;
     }
