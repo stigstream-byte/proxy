@@ -819,6 +819,7 @@ function rewriteM3U8Content(
   proxyBaseUrl: string,
   customHeaders: Record<string, string> = {},
   hostOverride = '',
+  noEncrypt = false,
 ): string {
   const rawHeadersJson = Object.keys(customHeaders).length > 0
     ? JSON.stringify(customHeaders)
@@ -835,6 +836,14 @@ function rewriteM3U8Content(
    * host is left in plaintext — it's not sensitive and the worker needs it unmodified.
    */
   function buildProxiedUrl(resolvedUrl: string, ep: string, extra = ''): string {
+    // noEncrypt=true: skip AES encryption so segment URLs are human-readable
+    // for latency testing. Never use in production.
+    if (noEncrypt) {
+      let params = `url=${encodeURIComponent(resolvedUrl)}&noencrypt=true`;
+      if (rawHeadersJson) params += `&headers=${encodeURIComponent(rawHeadersJson)}`;
+      if (hostOverride)   params += hostParam;
+      return `${proxyBaseUrl}${ep}?${params}${extra}`;
+    }
     const encUrl = encryptParam(resolvedUrl);
     let   params = `url=${encUrl}&encrypted=true`;
     if (encHeaders)   params += `&headers=${encHeaders}`;
@@ -1006,7 +1015,8 @@ async function handleM3U8(req: Request, res: Response, includeReferer: boolean):
     const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const proto    = req.get('x-forwarded-proto') || req.protocol;
     const proxyBase = `${proto === 'https' ? 'https' : 'https'}://${req.get('host')}`;
-    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride);
+    const noEncrypt = req.query.noencrypt === 'true';
+    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride, noEncrypt);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
 
