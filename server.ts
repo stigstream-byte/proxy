@@ -7,11 +7,18 @@ dotenv.config(); // Load .env before anything else reads process.env
 
 import express, { Request, Response, NextFunction } from 'express';
 import * as crypto from 'crypto';
+import * as dns from 'dns';
 import { notFoundHandler } from './src/middleware/notFound';
 import fetch, { Response as FetchResponse, RequestInit } from 'node-fetch';
 import * as http from 'http';
 import * as https from 'https';
 import { Readable } from 'stream';
+
+// Prefer IPv4 when resolving CDN hostnames. Node resolves both A and AAAA by
+// default and tries the first result — if that's an IPv6 address and the CDN's
+// IPv6 connectivity is flaky, every new connection stalls for several seconds
+// waiting for the v6 timeout before falling back to v4.
+dns.setDefaultResultOrder('ipv4first');
 
 // Use Node's built-in AbortController (Node 16+) to avoid type conflicts with node-fetch
 const { AbortController } = globalThis as unknown as { AbortController: typeof globalThis.AbortController };
@@ -458,10 +465,14 @@ function buildRequestHeaders(
   const headers: Record<string, string> = {
     'User-Agent':         ua,
     'Accept':             '*/*',
-    'Accept-Language':    pickRandom(ACCEPT_LANGUAGES),
+    // Stable value — rotating Accept-Language per request poisons CDN cache keys
+    // (many CDNs Vary on Accept-Language), causing a guaranteed cache miss every time.
+    'Accept-Language':    'en-US,en;q=0.9',
     'Accept-Encoding':    'identity', // Disable compression — gzip would cause Content-Length mismatch after decompression
-    'Cache-Control':      'no-cache',
-    'Pragma':             'no-cache',
+    // DO NOT send Cache-Control: no-cache or Pragma: no-cache upstream.
+    // Those headers instruct the CDN to bypass its cache and hit origin every request.
+    // CDN cache hits are ~30–80 ms; origin fetches are 1–10 s — this was the primary
+    // source of the 1–10 s latency on both /ts-proxy and /m3u8-proxy.
     'Connection':         'keep-alive',
     'Sec-Fetch-Dest':     'empty',
     'Sec-Fetch-Mode':     'cors',
