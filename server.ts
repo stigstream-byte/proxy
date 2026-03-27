@@ -299,10 +299,14 @@ const BLOCKED_RESPONSE_HEADERS = new Set<string>([
 
 const ENCRYPT_ALGORITHM = 'aes-256-cbc';
 
+// Parsed once at startup — avoids re-converting hex on every encrypt/decrypt call.
+let _cachedEncryptKey: Buffer | null = null;
 function _getEncryptKey(): Buffer {
+  if (_cachedEncryptKey) return _cachedEncryptKey;
   const hex = process.env.PROXY_ENCRYPT_KEY || 'a'.repeat(64); // fallback = dev only
   if (hex.length !== 64) throw new Error('PROXY_ENCRYPT_KEY must be 64 hex chars (32 bytes)');
-  return Buffer.from(hex, 'hex');
+  _cachedEncryptKey = Buffer.from(hex, 'hex');
+  return _cachedEncryptKey;
 }
 
 /**
@@ -809,6 +813,10 @@ function rewriteM3U8Content(
     ? JSON.stringify(customHeaders)
     : '';
 
+  // Encrypt headers once up-front — the same JSON is appended to every segment
+  // URL, so there's no reason to burn a crypto.randomBytes() + cipher per line.
+  const encHeaders = rawHeadersJson ? encryptParam(rawHeadersJson) : '';
+
   const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
 
   /**
@@ -816,10 +824,10 @@ function rewriteM3U8Content(
    * host is left in plaintext — it's not sensitive and the worker needs it unmodified.
    */
   function buildProxiedUrl(resolvedUrl: string, ep: string, extra = ''): string {
-    const encUrl     = encryptParam(resolvedUrl);
-    let   params     = `url=${encUrl}&encrypted=true`;
-    if (rawHeadersJson) params += `&headers=${encryptParam(rawHeadersJson)}`;
-    if (hostOverride)   params += hostParam;
+    const encUrl = encryptParam(resolvedUrl);
+    let   params = `url=${encUrl}&encrypted=true`;
+    if (encHeaders)   params += `&headers=${encHeaders}`;
+    if (hostOverride) params += hostParam;
     return `${proxyBaseUrl}${ep}?${params}${extra}`;
   }
 
