@@ -298,6 +298,8 @@ const BLOCKED_RESPONSE_HEADERS = new Set<string>([
   'access-control-allow-methods',
   'x-upstream-status',
   'transfer-encoding',
+  'cache-control',         // we set our own — upstream value would overwrite ours since forwardResponseHeaders runs after setHeader
+  'vary',                  // upstream Vary (e.g. Vary: * or Vary: Origin) prevents Cloudflare from caching; binary video needs none
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1023,14 +1025,22 @@ async function handleM3U8(req: Request, res: Response, includeReferer: boolean):
     // Cache-Control strategy:
     //   Master playlist  → short cache (5 s). Players rarely re-fetch, but stale quality lists cause ABR issues.
     //   VOD media playlist → moderate cache (30 s). Segment list is fixed but players poll for seek.
-    //   Live media playlist → no-cache. Player polls every target-duration; stale = buffering.
+    //   Live media playlist → no-store. Player polls every target-duration; stale = buffering.
+    //
+    // CDN-Cache-Control is the Cloudflare-specific header that instructs the edge to cache
+    // responses regardless of content-type or URL pattern (proxy paths like /m3u8-proxy?url=…
+    // have no cacheable file extension, so CF ignores Cache-Control alone by default).
     if (isMaster) {
-      res.setHeader('Cache-Control', 'public, max-age=5, stale-while-revalidate=5');
+      res.setHeader('Cache-Control',     'public, max-age=5, stale-while-revalidate=5');
+      res.setHeader('CDN-Cache-Control', 'public, max-age=5');
     } else if (isVOD) {
-      res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=60');
+      res.setHeader('Cache-Control',     'public, max-age=30, stale-while-revalidate=60');
+      res.setHeader('CDN-Cache-Control', 'public, max-age=30');
     } else {
-      res.setHeader('Cache-Control', 'no-cache, no-store');
-      res.setHeader('Pragma', 'no-cache');
+      // Live — must never be served stale; no-store skips both cache write and read
+      res.setHeader('Cache-Control',     'no-store');
+      res.setHeader('CDN-Cache-Control', 'no-store');
+      res.setHeader('Pragma',            'no-cache');
     }
 
     res.send(m3u8Content);
@@ -1209,7 +1219,13 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
     if (contentRange) res.setHeader('Content-Range', contentRange);
 
     // Segments are content-addressed and immutable — aggressive caching is safe.
-    res.setHeader('Cache-Control', rangeHeader ? 'public, max-age=3600' : 'public, max-age=3600, immutable');
+    // s-maxage=86400: Cloudflare edge TTL (24 h). max-age=3600: browser TTL (1 h).
+    // CDN-Cache-Control tells Cloudflare to cache these query-parameterised URLs
+    // which it would otherwise skip due to the non-standard path + query string.
+    // immutable omitted for range requests (byte ranges aren't truly immutable from
+    // the browser's perspective since the same URL can serve different ranges).
+    res.setHeader('Cache-Control',     rangeHeader ? 'public, max-age=3600, s-maxage=86400' : 'public, max-age=3600, s-maxage=86400, immutable');
+    res.setHeader('CDN-Cache-Control', 'public, max-age=86400');
 
     forwardResponseHeaders(targetResponse!, res);
     streamResponse(targetResponse!, res, clientController, stallMs, hwm);
@@ -1271,9 +1287,12 @@ app.get('/mp4-proxy', async (req: Request, res: Response) => {
     if (isRangeResponse && contentLength) res.setHeader('Content-Length', contentLength);
     if (contentRange)  res.setHeader('Content-Range',  contentRange);
 
-    // MP4: cache aggressively. Range requests are fine to cache — the URL is
-    // stable and the byte range is part of the response headers.
-    res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=300');
+    // MP4: cache aggressively. s-maxage=86400: Cloudflare edge TTL (24 h).
+    // stale-while-revalidate only on full responses — partial (206) responses
+    // are byte-specific and SWR doesn't apply meaningfully to range content.
+    // CDN-Cache-Control ensures Cloudflare caches the query-parameterised URL.
+    res.setHeader('Cache-Control',     isRangeResponse ? 'public, max-age=3600, s-maxage=86400' : 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=300');
+    res.setHeader('CDN-Cache-Control', 'public, max-age=86400');
 
     forwardResponseHeaders(targetResponse, res);
     streamResponse(targetResponse, res, clientController, MP4_STALL_MS, HWM_HIGH);
