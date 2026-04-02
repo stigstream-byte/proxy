@@ -111,6 +111,10 @@ app.set('json escape', false);
 // keepAliveMsecs: 60 s — prevents idle sockets from being evicted between segment bursts.
 const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 512, maxFreeSockets: 128, scheduling: 'lifo', keepAliveMsecs: 60000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 512, maxFreeSockets: 128, scheduling: 'lifo', keepAliveMsecs: 60000 });
+// Mutable references used by selectAgent — replaced by the agent-refresh interval
+// so destroyed agents are never reused after the refresh fires.
+let _liveHttpAgent:  http.Agent  = httpAgent;
+let _liveHttpsAgent: https.Agent = httpsAgent;
 
 // ── Host-override agent cache ────────────────────────────────────────────────
 // The original code created a new one-shot agent (keepAlive: false) per request,
@@ -121,13 +125,20 @@ const hostOverrideHttpAgentCache = new Map<string, http.Agent>();
 
 const AGENT_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 setInterval(() => {
+  // Destroy stale sockets then immediately recreate the agents so requests
+  // that arrive after the interval don't hit a destroyed (dead) agent and
+  // get ECONNRESET → 502.  The old code destroyed without recreating.
   httpAgent.destroy();
   httpsAgent.destroy();
+  // Re-initialise via the mutable wrapper so selectAgent() picks up the new instances
+  _liveHttpAgent  = new http.Agent({ keepAlive: true, maxSockets: 512, maxFreeSockets: 128, scheduling: 'lifo', keepAliveMsecs: 60000 });
+  _liveHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 512, maxFreeSockets: 128, scheduling: 'lifo', keepAliveMsecs: 60000 });
+
   hostOverrideAgentCache.forEach(a => a.destroy());
   hostOverrideAgentCache.clear();
   hostOverrideHttpAgentCache.forEach(a => a.destroy());
   hostOverrideHttpAgentCache.clear();
-  console.log('[agent-refresh] Stale keepAlive connections cleared');
+  console.log('[agent-refresh] Stale keepAlive connections cleared and agents recreated');
 }, AGENT_REFRESH_INTERVAL_MS).unref();
 
 function getHostOverrideAgent(url: string, hostOverride: string): http.Agent | https.Agent {
@@ -150,7 +161,8 @@ function getHostOverrideAgent(url: string, hostOverride: string): http.Agent | h
 
 function selectAgent(url: string, hostOverride: string): http.Agent | https.Agent {
   if (hostOverride) return getHostOverrideAgent(url, hostOverride);
-  return url.startsWith('https') ? httpsAgent : httpAgent;
+  // Use live references so post-refresh requests get the new agents, not the destroyed ones
+  return url.startsWith('https') ? _liveHttpsAgent : _liveHttpAgent;
 }
 
 // ---------------------------------------------------------------------------
@@ -661,7 +673,8 @@ async function hedgedSegmentFetch(
     function fail(err: unknown): void {
       if (settled) return;
       settled = true;
-      if (hedgeTimer) clearTimeout(hedgeTimer);
+      if (hedgeTimer) { clearTimeout(hedgeTimer); hedgeTimer = null; }
+      // Abort all pending attempts before rejecting so no dangling fetch leaks
       for (const c of controllers) {
         try { c.abort(); } catch { /* ignore */ }
       }
@@ -781,7 +794,9 @@ function streamResponse(
 
   body?.on('data',  scheduleStall);
   body?.on('end',   cancelStall);
-  body?.on('error', cancelStall);
+  // Note: do NOT call cancelStall on 'error' — the error handler closes the
+  // connection immediately, so the stall timer is moot. Cancelling it here
+  // was masking upstream errors by silently leaving the response half-open.
 
   res.on('close', () => {
     cancelStall();
@@ -1158,7 +1173,10 @@ app.get('/ts-proxy', async (req: Request, res: Response) => {
     // ── Segment deduplication ──────────────────────────────────────────────
     // Coalesce concurrent identical requests (ABR probing, multi-player) into
     // one upstream fetch.  Range requests are byte-specific — never dedup.
-    const dedupKey = rangeHeader ? null : `${targetUrl}:${hostOverride}`;
+    // Include a stable headers hash in the dedup key so callers with different
+    // auth/session headers never share a response body that the first consumer drains.
+    const headersHash = Object.keys(requestHeaders).sort().map(k => `${k}:${requestHeaders[k]}`).join('|');
+    const dedupKey = rangeHeader ? null : `${targetUrl}:${hostOverride}:${headersHash}`;
     let fetchPromise: Promise<ExtendedResponse>;
 
     if (dedupKey && pendingSegments.has(dedupKey)) {
