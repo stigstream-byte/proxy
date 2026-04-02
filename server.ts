@@ -6,7 +6,6 @@ import * as dotenv from 'dotenv';
 dotenv.config(); // Load .env before anything else reads process.env
 
 import express, { Request, Response, NextFunction } from 'express';
-import * as crypto from 'crypto';
 import * as dns from 'dns';
 import { notFoundHandler } from './src/middleware/notFound';
 import fetch, { Response as FetchResponse, RequestInit } from 'node-fetch';
@@ -314,48 +313,10 @@ const BLOCKED_RESPONSE_HEADERS = new Set<string>([
   'vary',                  // upstream Vary (e.g. Vary: * or Vary: Origin) prevents Cloudflare from caching; binary video needs none
 ]);
 
-// ---------------------------------------------------------------------------
-// Param encryption / decryption (AES-256-CBC — matches proxyEncrypt.js)
-// ---------------------------------------------------------------------------
-
-const ENCRYPT_ALGORITHM = 'aes-256-cbc';
-
-// Parsed once at startup — avoids re-converting hex on every encrypt/decrypt call.
-let _cachedEncryptKey: Buffer | null = null;
-function _getEncryptKey(): Buffer {
-  if (_cachedEncryptKey) return _cachedEncryptKey;
-  const hex = process.env.PROXY_ENCRYPT_KEY || 'a'.repeat(64); // fallback = dev only
-  if (hex.length !== 64) throw new Error('PROXY_ENCRYPT_KEY must be 64 hex chars (32 bytes)');
-  _cachedEncryptKey = Buffer.from(hex, 'hex');
-  return _cachedEncryptKey;
-}
-
-/**
- * Encrypt a plaintext string → IV-prefixed hex (matches proxyEncrypt.js encryptValue).
- * First 32 hex chars = IV, rest = ciphertext.
- */
-function encryptParam(plaintext: string): string {
-  const key    = _getEncryptKey();
-  const iv     = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ENCRYPT_ALGORITHM, key, iv);
-  const enc    = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  return iv.toString('hex') + enc.toString('hex');
-}
-
-/**
- * Decrypt an IV-prefixed hex string produced by encryptParam / proxyEncrypt.js.
- */
-function decryptParam(hex: string): string {
-  const key      = _getEncryptKey();
-  const iv       = Buffer.from(hex.slice(0, 32), 'hex');
-  const ct       = Buffer.from(hex.slice(32), 'hex');
-  const decipher = crypto.createDecipheriv(ENCRYPT_ALGORITHM, key, iv);
-  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
-}
 
 // ---------------------------------------------------------------------------
 // CORS middleware — must be first so OPTIONS preflights are handled before
-// any other middleware (including decrypt) can interfere.
+// any other middleware can interfere.
 // ---------------------------------------------------------------------------
 
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -370,30 +331,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// ---------------------------------------------------------------------------
-// Decrypt middleware — runs before every route (but after CORS)
-// When &encrypted=true is present, decrypts `url` and `headers` in req.query
-// so all downstream handlers see plain values as if encryption never happened.
-// ---------------------------------------------------------------------------
-
-app.use((req: Request, _res: Response, next: NextFunction) => {
-  if (req.query.encrypted !== 'true') return next();
-
-  try {
-    if (typeof req.query.url === 'string') {
-      (req.query as Record<string, unknown>).url = decryptParam(req.query.url);
-    }
-    if (typeof req.query.headers === 'string') {
-      (req.query as Record<string, unknown>).headers = decryptParam(req.query.headers);
-    }
-    delete (req.query as Record<string, unknown>).encrypted;
-  } catch (err) {
-    logger.warn('✗ Failed to decrypt query params:', (err as Error).message);
-    // Let it fall through — downstream validators will reject the garbled URL
-  }
-
-  next();
-});
 
 app.use(express.json());
 
@@ -837,35 +774,20 @@ function rewriteM3U8Content(
   proxyBaseUrl: string,
   customHeaders: Record<string, string> = {},
   hostOverride = '',
-  noEncrypt = false,
 ): string {
   const rawHeadersJson = Object.keys(customHeaders).length > 0
     ? JSON.stringify(customHeaders)
     : '';
 
-  // Encrypt headers once up-front — the same JSON is appended to every segment
-  // URL, so there's no reason to burn a crypto.randomBytes() + cipher per line.
-  const encHeaders = rawHeadersJson ? encryptParam(rawHeadersJson) : '';
-
   const hostParam = hostOverride ? `&host=${encodeURIComponent(hostOverride)}` : '';
 
   /**
-   * Build a proxied URL with encrypted `url` (and `headers`) values.
-   * host is left in plaintext — it's not sensitive and the worker needs it unmodified.
+   * Build a proxied URL with plain-encoded `url` (and `headers`) values.
    */
   function buildProxiedUrl(resolvedUrl: string, ep: string, extra = ''): string {
-    // noEncrypt=true: skip AES encryption so segment URLs are human-readable
-    // for latency testing. Never use in production.
-    if (noEncrypt) {
-      let params = `url=${encodeURIComponent(resolvedUrl)}&noencrypt=true`;
-      if (rawHeadersJson) params += `&headers=${encodeURIComponent(rawHeadersJson)}`;
-      if (hostOverride)   params += hostParam;
-      return `${proxyBaseUrl}${ep}?${params}${extra}`;
-    }
-    const encUrl = encryptParam(resolvedUrl);
-    let   params = `url=${encUrl}&encrypted=true`;
-    if (encHeaders)   params += `&headers=${encHeaders}`;
-    if (hostOverride) params += hostParam;
+    let params = `url=${encodeURIComponent(resolvedUrl)}`;
+    if (rawHeadersJson) params += `&headers=${encodeURIComponent(rawHeadersJson)}`;
+    if (hostOverride)   params += hostParam;
     return `${proxyBaseUrl}${ep}?${params}${extra}`;
   }
 
@@ -1033,8 +955,7 @@ async function handleM3U8(req: Request, res: Response, includeReferer: boolean):
     const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
     const proto    = req.get('x-forwarded-proto') || req.protocol;
     const proxyBase = `${proto === 'https' ? 'https' : 'https'}://${req.get('host')}`;
-    const noEncrypt = req.query.noencrypt === 'true';
-    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride, noEncrypt);
+    m3u8Content = rewriteM3U8Content(m3u8Content, baseUrl, proxyBase, customHeaders, hostOverride);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
 
