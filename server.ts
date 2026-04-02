@@ -1,6 +1,7 @@
 /**
  * Lightweight Streaming Proxy Server
  * Forwards requests to upstream URLs, bypassing CORS.
+ * Rewrites M3U8 playlists so all segment/playlist URLs stay proxied.
  */
 
 import * as dotenv from 'dotenv';
@@ -14,18 +15,15 @@ import * as https from 'https';
 const app = express();
 app.set('trust proxy', true);
 
-const IS_DEV   = (process.env.NODE_ENV ?? 'development') !== 'production';
+const IS_DEV = (process.env.NODE_ENV ?? 'development') !== 'production';
 const PORT: number = process.env.PORT ? parseInt(process.env.PORT, 10) : IS_DEV ? 3003 : 3000;
 
-// ---------------------------------------------------------------------------
 // Keep-alive agents — reuse TCP/TLS connections across requests
-// ---------------------------------------------------------------------------
-
 const httpAgent  = new http.Agent({ keepAlive: true });
 const httpsAgent = new https.Agent({ keepAlive: true });
 
 // ---------------------------------------------------------------------------
-// CORS — must be first
+// CORS — first middleware, handles preflight immediately
 // ---------------------------------------------------------------------------
 
 app.use((_req: Request, res: Response, next: NextFunction) => {
@@ -60,7 +58,7 @@ function validateUrl(raw: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Headers to strip from the upstream response before forwarding to client
+// Response headers to strip before forwarding to client
 // ---------------------------------------------------------------------------
 
 const STRIP_RESPONSE_HEADERS = new Set([
@@ -68,12 +66,75 @@ const STRIP_RESPONSE_HEADERS = new Set([
   'access-control-allow-headers',
   'access-control-allow-methods',
   'access-control-expose-headers',
-  'content-encoding',   // node-fetch decompresses; forwarding causes double-decompress
+  'content-encoding',   // node-fetch decompresses; forwarding this causes double-decompress
   'transfer-encoding',
 ]);
 
 // ---------------------------------------------------------------------------
-// Core proxy handler — used by all routes
+// M3U8 rewriter — rewrites every URL in a playlist to go through this proxy
+// ---------------------------------------------------------------------------
+
+function rewriteM3U8(content: string, baseUrl: string, proxyBase: string, headersParam: string): string {
+  // Build absolute URL from a possibly-relative href
+  function abs(href: string): string {
+    try { return new URL(href, baseUrl).href; } catch { return href; }
+  }
+
+  // Wrap an absolute upstream URL in a proxy URL
+  function proxied(href: string, endpoint: string): string {
+    const absolute = abs(href);
+    let qs = `url=${encodeURIComponent(absolute)}`;
+    if (headersParam) qs += `&headers=${encodeURIComponent(headersParam)}`;
+    return `${proxyBase}${endpoint}?${qs}`;
+  }
+
+  const lines = content.split('\n');
+  const out: string[] = [];
+  let nextLineIsSegment = false;
+
+  for (const line of lines) {
+    const t = line.trim();
+
+    // Blank lines pass through
+    if (!t) { out.push(line); continue; }
+
+    // After #EXT-X-STREAM-INF, the next non-comment line is a variant playlist URL
+    if (nextLineIsSegment && !t.startsWith('#')) {
+      out.push(proxied(t, '/m3u8-proxy'));
+      nextLineIsSegment = false;
+      continue;
+    }
+
+    if (t.startsWith('#EXT-X-STREAM-INF')) {
+      out.push(line);
+      nextLineIsSegment = true;
+      continue;
+    }
+
+    // Rewrite URI="..." attributes in tags like #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.
+    if (t.startsWith('#') && t.includes('URI="')) {
+      const rewritten = t.replace(/URI="([^"]+)"/g, (_match, href) => {
+        const isPlaylist = href.includes('.m3u8') || href.includes('/playlist') || href.includes('/master');
+        return `URI="${proxied(href, isPlaylist ? '/m3u8-proxy' : '/fetch')}"`;
+      });
+      out.push(rewritten);
+      continue;
+    }
+
+    // Non-comment, non-empty lines that aren't a variant URL are segment URLs
+    if (!t.startsWith('#')) {
+      out.push(proxied(t, '/ts-proxy'));
+      continue;
+    }
+
+    out.push(line);
+  }
+
+  return out.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Core proxy handler
 // ---------------------------------------------------------------------------
 
 async function proxy(req: Request, res: Response): Promise<void> {
@@ -90,7 +151,6 @@ async function proxy(req: Request, res: Response): Promise<void> {
     try { customHeaders = JSON.parse(headersParam); } catch { /* ignore malformed */ }
   }
 
-  // Build upstream request headers; pass through Range for video seeking
   const upstreamHeaders: Record<string, string> = { ...customHeaders };
   const range = req.headers['range'];
   if (range) upstreamHeaders['range'] = range;
@@ -107,15 +167,39 @@ async function proxy(req: Request, res: Response): Promise<void> {
       agent,
     });
 
-    // Forward status + upstream headers (minus stripped ones)
+    // For M3U8 routes, buffer and rewrite the playlist before sending
+    const isM3U8Route = req.path === '/m3u8-proxy';
+    const contentType = upstream.headers.get('content-type') || '';
+    const looksLikeM3U8 = isM3U8Route || contentType.includes('mpegurl') || targetUrl.includes('.m3u8');
+
+    if (looksLikeM3U8 && upstream.ok) {
+      const text = await upstream.text();
+      if (text.includes('#EXTM3U')) {
+        const proto    = req.get('x-forwarded-proto') || req.protocol;
+        const proxyBase = `${proto}://${req.get('host')}`;
+        const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+        const rewritten = rewriteM3U8(text, baseUrl, proxyBase, headersParam || '');
+
+        res.status(upstream.status);
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(rewritten);
+        return;
+      }
+      // Not actually an M3U8 — fall through and send as-is
+      res.status(upstream.status);
+      upstream.headers.forEach((value, key) => {
+        if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
+      });
+      res.send(text);
+      return;
+    }
+
+    // Everything else: stream straight through
     res.status(upstream.status);
     upstream.headers.forEach((value, key) => {
-      if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) {
-        res.setHeader(key, value);
-      }
+      if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
     });
 
-    // Stream body straight through — no buffering
     if (upstream.body) {
       upstream.body.pipe(res);
       upstream.body.on('error', () => res.destroy());
@@ -124,7 +208,7 @@ async function proxy(req: Request, res: Response): Promise<void> {
     }
 
   } catch (e: any) {
-    if (e?.name === 'AbortError') return; // client disconnected — nothing to do
+    if (e?.name === 'AbortError') return;
     console.error('[proxy error]', e?.message);
     if (!res.headersSent) res.status(502).json({ error: 'Upstream fetch failed', message: e?.message });
   }
