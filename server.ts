@@ -342,7 +342,24 @@ function decryptParam(hex: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Decrypt middleware — runs before every route
+// CORS middleware — must be first so OPTIONS preflights are handled before
+// any other middleware (including decrypt) can interfere.
+// ---------------------------------------------------------------------------
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.header('Access-Control-Allow-Origin',   '*');
+  res.header('Access-Control-Allow-Methods',  '*');
+  res.header('Access-Control-Allow-Headers',  '*');
+  res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Date, Server, X-Cache-Hit, X-Upstream-Status');
+  res.header('Access-Control-Max-Age',        '86400');
+  res.header('Timing-Allow-Origin',           '*');
+
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// Decrypt middleware — runs before every route (but after CORS)
 // When &encrypted=true is present, decrypts `url` and `headers` in req.query
 // so all downstream handlers see plain values as if encryption never happened.
 // ---------------------------------------------------------------------------
@@ -363,22 +380,6 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
     // Let it fall through — downstream validators will reject the garbled URL
   }
 
-  next();
-});
-
-// ---------------------------------------------------------------------------
-// CORS middleware
-// ---------------------------------------------------------------------------
-
-app.use((req: Request, res: Response, next: NextFunction) => {
-  res.header('Access-Control-Allow-Origin',   '*');
-  res.header('Access-Control-Allow-Methods',  '*');
-  res.header('Access-Control-Allow-Headers',  '*');
-  res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Date, Server, X-Cache-Hit, X-Upstream-Status');
-  res.header('Access-Control-Max-Age',        '86400');
-  res.header('Timing-Allow-Origin',           '*');
-
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
