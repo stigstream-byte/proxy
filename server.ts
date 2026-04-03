@@ -35,8 +35,9 @@ if (cluster.isPrimary) {
     console.warn(`Worker ${worker.process.pid} died — restarting`);
     cluster.fork();
   });
-  process.exit(0); // primary doesn't serve requests
-}
+  // Primary stays alive — it owns the IPC channel to each worker.
+  // Calling process.exit() here sends SIGHUP to all workers, killing them.
+} else {
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -333,3 +334,4 @@ server.on('connection', (socket) => {
 server.listen(PORT, () => {
   console.log(`Worker ${process.pid} — proxy on port ${PORT} [${IS_DEV ? 'development' : 'production'}]`);
 });
+} // end cluster worker
