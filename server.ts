@@ -101,6 +101,7 @@ const STRIP_RESPONSE_HEADERS = new Set([
   'access-control-expose-headers',
   'content-encoding',    // node decompresses; forwarding causes double-decompress
   'transfer-encoding',
+  'content-length',      // <-- ADD THIS
 ]);
 
 // ---------------------------------------------------------------------------
@@ -305,7 +306,7 @@ async function proxy(req: Request, res: Response): Promise<void> {
 
   const agent      = agentFor(targetUrl);
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  res.on('close', () => controller.abort());
 
   try {
     const upstream = await fetch(targetUrl, {
@@ -319,7 +320,8 @@ async function proxy(req: Request, res: Response): Promise<void> {
     const looksLikeM3U8 = isM3U8Route || contentType.includes('mpegurl') || targetUrl.includes('.m3u8');
 
     if (looksLikeM3U8 && upstream.ok) {
-      const text = await upstream.text();
+      const buf = await upstream.arrayBuffer();
+      const text = Buffer.from(buf).toString("utf8");
       if (text.includes('#EXTM3U')) {
         const proto     = req.get('x-forwarded-proto') || req.protocol;
         const proxyBase = `${proto}://${req.get('host')}`;
