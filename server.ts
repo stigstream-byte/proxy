@@ -146,6 +146,10 @@ function parseProxyParams(req: Request): {
     } catch { /* ignore malformed */ }
   }
 
+  // Force uncompressed response — we don't decompress, so gzip/brotli
+  // bodies would arrive as garbled binary. identity ensures plain text/bytes.
+  upstreamHeaders['accept-encoding'] = 'identity';
+
   return { targetUrl, upstreamHeaders, headersParam };
 }
 
