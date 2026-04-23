@@ -29,12 +29,13 @@ import * as https from 'https';
 // ---------------------------------------------------------------------------
 
 const NUM_CPUS = os.availableParallelism?.() ?? os.cpus().length;
+const IS_DEV   = (process.env.NODE_ENV ?? 'development') !== 'production';
 
 if (cluster.isPrimary) {
-  console.log(`Primary ${process.pid} starting ${NUM_CPUS} workers`);
+  if (IS_DEV) console.log(`Primary ${process.pid} starting ${NUM_CPUS} workers`);
   for (let i = 0; i < NUM_CPUS; i++) cluster.fork();
   cluster.on('exit', (worker) => {
-    console.warn(`Worker ${worker.process.pid} died — restarting`);
+    if (IS_DEV) console.warn(`Worker ${worker.process.pid} died — restarting`);
     cluster.fork();
   });
 } else {
@@ -43,8 +44,7 @@ if (cluster.isPrimary) {
 // Constants
 // ---------------------------------------------------------------------------
 
-const IS_DEV  = (process.env.NODE_ENV ?? 'development') !== 'production';
-const PORT    = process.env.PORT ? parseInt(process.env.PORT, 10) : IS_DEV ? 3003 : 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : IS_DEV ? 3003 : 3000;
 
 // Sized for 2 cores: HLS players open 2–6 parallel fetches per worker.
 // 64 sockets per agent is more than enough headroom.
@@ -272,13 +272,13 @@ async function tsProxy(req: Request, res: Response): Promise<void> {
         return;
       } catch (retryErr: any) {
         if (retryErr?.code === 'UND_ERR_ABORTED' || retryErr?.name === 'AbortError') return;
-        console.error('[ts-proxy retry failed]', retryErr?.message);
+        if (IS_DEV) console.error('[ts-proxy retry failed]', retryErr?.message);
         if (!res.headersSent) res.status(502).json({ error: 'Upstream fetch failed', message: retryErr?.message });
         return;
       }
     }
 
-    console.error('[ts-proxy error]', e?.message);
+    if (IS_DEV) console.error('[ts-proxy error]', e?.message);
     if (!res.headersSent) res.status(502).json({ error: 'Upstream fetch failed', message: e?.message });
   }
 }
@@ -355,7 +355,7 @@ async function proxy(req: Request, res: Response): Promise<void> {
 
   } catch (e: any) {
     if (e?.name === 'AbortError') return;
-    console.error('[proxy error]', e?.message);
+    if (IS_DEV) console.error('[proxy error]', e?.message);
     if (!res.headersSent) res.status(502).json({ error: 'Upstream fetch failed', message: e?.message });
   }
 }
@@ -406,6 +406,6 @@ server.on('connection', (socket) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Worker ${process.pid} — proxy on port ${PORT} [${IS_DEV ? 'development' : 'production'}]`);
+  if (IS_DEV) console.log(`Worker ${process.pid} — proxy on port ${PORT} [${IS_DEV ? 'development' : 'production'}]`);
 });
 } // end cluster worker
