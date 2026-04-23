@@ -4,9 +4,11 @@
  * Rewrites M3U8 playlists so all segment/playlist URLs stay proxied.
  *
  * Performance notes:
- *  - /ts-proxy uses native http/https.request() piped directly into the
- *    Express response — zero-copy, no library overhead, connection reuse
+ *  - /fetch and /ts-proxy use native http/https.request() piped directly into
+ *    the Express response — zero-copy, no library overhead, connection reuse
  *    via the shared keep-alive agents.
+ *  - /m3u8-proxy still uses node-fetch because it must buffer the full body
+ *    to rewrite playlist URLs before sending.
  *  - All routes share the same two keep-alive agents (http + https), so
  *    every route benefits from connection pooling automatically.
  *  - cluster forks one worker per logical CPU; TCP_NODELAY set per socket.
@@ -46,9 +48,10 @@ if (cluster.isPrimary) {
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : IS_DEV ? 3003 : 3000;
 
-// Sized for 2 cores: HLS players open 2–6 parallel fetches per worker.
-// 64 sockets per agent is more than enough headroom.
-const POOL_SIZE = 64;
+// Scaled for high concurrency: each worker handles many parallel upstream
+// connections. At 10k users/hour the burst can be 50–150 req/s; 256 sockets
+// gives headroom without pinning all available file descriptors.
+const POOL_SIZE = Math.max(256, NUM_CPUS * 32);
 
 // ---------------------------------------------------------------------------
 // Shared keep-alive agents — used by every route.
@@ -58,8 +61,18 @@ const POOL_SIZE = 64;
 // fifo scheduling spreads load evenly so sockets don't idle and close.
 // ---------------------------------------------------------------------------
 
-const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: POOL_SIZE, scheduling: 'fifo' });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: POOL_SIZE, scheduling: 'fifo' });
+const httpAgent  = new http.Agent({
+  keepAlive:      true,
+  maxSockets:     POOL_SIZE,
+  maxFreeSockets: 64,          // idle sockets kept warm per worker
+  scheduling:     'fifo',
+});
+const httpsAgent = new https.Agent({
+  keepAlive:      true,
+  maxSockets:     POOL_SIZE,
+  maxFreeSockets: 64,
+  scheduling:     'fifo',
+});
 
 function agentFor(url: string): http.Agent | https.Agent {
   return url.startsWith('https') ? httpsAgent : httpAgent;
@@ -101,7 +114,7 @@ const STRIP_RESPONSE_HEADERS = new Set([
   'access-control-expose-headers',
   'content-encoding',    // node decompresses; forwarding causes double-decompress
   'transfer-encoding',
-  'content-length',      // <-- ADD THIS
+  'content-length',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -169,24 +182,23 @@ function rewriteM3U8(content: string, baseUrl: string, proxyBase: string, header
 }
 
 // ---------------------------------------------------------------------------
-// Fast TS-proxy handler — native http/https, direct pipe, one retry
+// Native streaming proxy — shared by /fetch, /ts-proxy, /subtitle, /mp4-proxy
+//
+// Mirrors the tsProxy approach: native http/https, direct pipe, timeouts, retry.
+//
+// Timeouts (tuned for general HTTP content, not just TS segments):
+//   headersTimeout: 15s — abort if upstream doesn't respond in time
+//   bodyTimeout:    60s — abort a stalled mid-stream transfer
+//
+// One retry fires before headers are sent so the caller never sees the error.
 // ---------------------------------------------------------------------------
-//
-// http.request() with the keep-alive agent reuses open TCP connections to
-// the same CDN origin, giving the same pooling benefit as undici with zero
-// extra dependencies. The upstream response body is piped straight into the
-// Express response — no intermediate buffering, backpressure handled by Node.
-//
-// Timeouts:
-//   headersTimeout: 20s — aborts if the CDN doesn't respond in time
-//   bodyTimeout:    30s — aborts a stalled mid-stream transfer
-//
-// One retry fires before headers are sent so the player never sees the error.
 
-function tsProxyAttempt(
+function nativeProxyAttempt(
   targetUrl: string,
   upstreamHeaders: Record<string, string>,
   res: Response,
+  headersTimeoutMs = 15_000,
+  bodyTimeoutMs    = 60_000,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
@@ -216,14 +228,14 @@ function tsProxyAttempt(
 
         upstream.pipe(res);
 
-        // Body stall guard — 30s without new data triggers an abort
+        // Body stall guard — reset on every chunk
         let bodyTimer = setTimeout(() => {
           req.destroy(new Error('Body timeout'));
-        }, 30_000);
+        }, bodyTimeoutMs);
 
         upstream.on('data', () => {
           clearTimeout(bodyTimer);
-          bodyTimer = setTimeout(() => req.destroy(new Error('Body timeout')), 30_000);
+          bodyTimer = setTimeout(() => req.destroy(new Error('Body timeout')), bodyTimeoutMs);
         });
 
         upstream.on('end',   () => { clearTimeout(bodyTimer); resolve(); });
@@ -232,13 +244,77 @@ function tsProxyAttempt(
       },
     );
 
-    // Headers timeout — 20s to first byte of response headers
-    req.setTimeout(20_000, () => req.destroy(new Error('Headers timeout')));
+    // Headers timeout — abort if upstream doesn't start responding
+    req.setTimeout(headersTimeoutMs, () => req.destroy(new Error('Headers timeout')));
 
     req.on('error', reject);
     req.end();
   });
 }
+
+// ---------------------------------------------------------------------------
+// /fetch  handler — native http/https, timeouts, one retry
+//
+// Used by scrapers fetching JSON responses, HTML documents, and similar.
+// Replaces the old node-fetch–based proxy() for all non-M3U8 routes.
+// ---------------------------------------------------------------------------
+
+async function fetchProxy(req: Request, res: Response): Promise<void> {
+  const targetUrl = req.query.url as string | undefined;
+  if (!targetUrl) { res.status(400).json({ error: 'Missing url parameter' }); return; }
+
+  const validationError = validateUrl(targetUrl);
+  if (validationError) { res.status(400).json({ error: validationError }); return; }
+
+  let customHeaders: Record<string, string> = {};
+  const headersParam = req.query.headers as string | undefined;
+  if (headersParam) {
+    try { customHeaders = JSON.parse(headersParam); } catch { /* ignore */ }
+  }
+
+  const upstreamHeaders: Record<string, string> = { ...customHeaders };
+  const range = req.headers['range'];
+  if (range) upstreamHeaders['range'] = range;
+
+  req.on('close', () => { if (!res.writableEnded) res.destroy(); });
+
+  try {
+    await nativeProxyAttempt(targetUrl, upstreamHeaders, res);
+  } catch (e: any) {
+    if (e?.code === 'UND_ERR_ABORTED' || e?.name === 'AbortError') return;
+
+    // One retry before giving up — only safe if nothing has been sent yet
+    if (!res.headersSent) {
+      try {
+        await nativeProxyAttempt(targetUrl, upstreamHeaders, res);
+        return;
+      } catch (retryErr: any) {
+        if (retryErr?.code === 'UND_ERR_ABORTED' || retryErr?.name === 'AbortError') return;
+        if (IS_DEV) console.error('[fetch-proxy retry failed]', retryErr?.message);
+        if (!res.headersSent) res.status(502).json({ error: 'Upstream fetch failed', message: retryErr?.message });
+        return;
+      }
+    }
+
+    if (IS_DEV) console.error('[fetch-proxy error]', e?.message);
+    if (!res.headersSent) res.status(502).json({ error: 'Upstream fetch failed', message: e?.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fast TS-proxy handler — native http/https, direct pipe, one retry
+// ---------------------------------------------------------------------------
+//
+// http.request() with the keep-alive agent reuses open TCP connections to
+// the same CDN origin, giving the same pooling benefit as undici with zero
+// extra dependencies. The upstream response body is piped straight into the
+// Express response — no intermediate buffering, backpressure handled by Node.
+//
+// Timeouts:
+//   headersTimeout: 20s — aborts if the CDN doesn't respond in time
+//   bodyTimeout:    30s — aborts a stalled mid-stream transfer
+//
+// One retry fires before headers are sent so the player never sees the error.
 
 async function tsProxy(req: Request, res: Response): Promise<void> {
   const targetUrl = req.query.url as string | undefined;
@@ -260,15 +336,13 @@ async function tsProxy(req: Request, res: Response): Promise<void> {
   req.on('close', () => { if (!res.writableEnded) res.destroy(); });
 
   try {
-    await tsProxyAttempt(targetUrl, upstreamHeaders, res);
+    await nativeProxyAttempt(targetUrl, upstreamHeaders, res, 20_000, 30_000);
   } catch (e: any) {
     if (e?.code === 'UND_ERR_ABORTED' || e?.name === 'AbortError') return;
 
-    // One retry before giving up — prevents ABR quality ladder-down on
-    // transient CDN hiccups. Only safe to retry if nothing has been sent yet.
     if (!res.headersSent) {
       try {
-        await tsProxyAttempt(targetUrl, upstreamHeaders, res);
+        await nativeProxyAttempt(targetUrl, upstreamHeaders, res, 20_000, 30_000);
         return;
       } catch (retryErr: any) {
         if (retryErr?.code === 'UND_ERR_ABORTED' || retryErr?.name === 'AbortError') return;
@@ -284,10 +358,10 @@ async function tsProxy(req: Request, res: Response): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Generic proxy handler (node-fetch) — used by all other routes
+// M3U8 proxy handler (node-fetch) — must buffer full body to rewrite URLs
 // ---------------------------------------------------------------------------
 
-async function proxy(req: Request, res: Response): Promise<void> {
+async function m3u8Proxy(req: Request, res: Response): Promise<void> {
   const targetUrl = req.query.url as string | undefined;
   if (!targetUrl) { res.status(400).json({ error: 'Missing url parameter' }); return; }
 
@@ -306,7 +380,11 @@ async function proxy(req: Request, res: Response): Promise<void> {
 
   const agent      = agentFor(targetUrl);
   const controller = new AbortController();
+  // Abort the upstream fetch if the client disconnects
   res.on('close', () => controller.abort());
+
+  // 20s timeout — M3U8 playlists are tiny; should arrive quickly
+  const timeoutId = setTimeout(() => controller.abort(), 20_000);
 
   try {
     const upstream = await fetch(targetUrl, {
@@ -315,13 +393,14 @@ async function proxy(req: Request, res: Response): Promise<void> {
       agent,
     });
 
-    const isM3U8Route   = req.path === '/m3u8-proxy';
+    clearTimeout(timeoutId);
+
     const contentType   = upstream.headers.get('content-type') || '';
-    const looksLikeM3U8 = isM3U8Route || contentType.includes('mpegurl') || targetUrl.includes('.m3u8');
+    const looksLikeM3U8 = contentType.includes('mpegurl') || targetUrl.includes('.m3u8');
 
     if (looksLikeM3U8 && upstream.ok) {
-      const buf = await upstream.arrayBuffer();
-      const text = Buffer.from(buf).toString("utf8");
+      const buf  = await upstream.arrayBuffer();
+      const text = Buffer.from(buf).toString('utf8');
       if (text.includes('#EXTM3U')) {
         const proto     = req.get('x-forwarded-proto') || req.protocol;
         const proxyBase = `${proto}://${req.get('host')}`;
@@ -341,6 +420,7 @@ async function proxy(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    // Non-M3U8 response — stream it
     res.status(upstream.status);
     upstream.headers.forEach((value, key) => {
       if (!STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) res.setHeader(key, value);
@@ -354,8 +434,9 @@ async function proxy(req: Request, res: Response): Promise<void> {
     }
 
   } catch (e: any) {
+    clearTimeout(timeoutId);
     if (e?.name === 'AbortError') return;
-    if (IS_DEV) console.error('[proxy error]', e?.message);
+    if (IS_DEV) console.error('[m3u8-proxy error]', e?.message);
     if (!res.headersSent) res.status(502).json({ error: 'Upstream fetch failed', message: e?.message });
   }
 }
@@ -384,11 +465,15 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
 // ---------------------------------------------------------------------------
 
 app.get('/health',     (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
-app.get('/proxy',      proxy);
-app.get('/m3u8-proxy', proxy);
-app.get('/fetch',      proxy);
-app.get('/subtitle',   proxy);
-app.get('/mp4-proxy',  proxy);
+
+// Native http/https — timeouts + retry — used for scraping JSON/HTML
+app.get('/fetch',      fetchProxy);
+app.get('/subtitle',   fetchProxy);
+app.get('/mp4-proxy',  fetchProxy);
+app.get('/proxy',      fetchProxy);
+
+// Buffered — must read full body to rewrite playlist URLs
+app.get('/m3u8-proxy', m3u8Proxy);
 
 // Fast segment handler — native http/https, keep-alive pooling, direct pipe
 app.get('/ts-proxy',   tsProxy);
