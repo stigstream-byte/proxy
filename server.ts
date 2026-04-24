@@ -315,6 +315,104 @@ async function m3u8Proxy(req: Request, res: Response): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// M3U8-only rewriter — rewrites nested playlist URLs only, TS segments untouched
+// ---------------------------------------------------------------------------
+
+function rewriteM3U8PlaylistsOnly(content: string, baseUrl: string, proxyBase: string, headersParam: string): string {
+  function proxiedPlaylist(href: string): string {
+    let abs: string;
+    try { abs = new URL(href, baseUrl).href; } catch { abs = href; }
+    let qs = `url=${encodeURIComponent(abs)}`;
+    if (headersParam) qs += `&headers=${encodeURIComponent(headersParam)}`;
+    return `${proxyBase}/m3u8-only-proxy?${qs}`;
+  }
+
+  function absoluteSegment(href: string): string {
+    try { return new URL(href, baseUrl).href; } catch { return href; }
+  }
+
+  const out: string[] = [];
+  let nextIsVariant = false;
+
+  for (const line of content.split('\n')) {
+    const t = line.trim();
+    if (!t) { out.push(line); continue; }
+
+    // The line after #EXT-X-STREAM-INF is a variant playlist URI
+    if (nextIsVariant && !t.startsWith('#')) {
+      out.push(proxiedPlaylist(t));
+      nextIsVariant = false;
+      continue;
+    }
+
+    if (t.startsWith('#EXT-X-STREAM-INF')) {
+      out.push(line);
+      nextIsVariant = true;
+      continue;
+    }
+
+    // #EXT-X-MAP — initialization segment, leave URL absolute but don't proxy
+    if (t.startsWith('#EXT-X-MAP')) {
+      out.push(t.replace(/URI="([^"]+)"/g, (_m, h) => `URI="${absoluteSegment(h)}"`));
+      continue;
+    }
+
+    // Other tags with URI="" — proxy if it looks like a playlist, absolutise otherwise
+    if (t.startsWith('#') && t.includes('URI="')) {
+      out.push(t.replace(/URI="([^"]+)"/g, (_m, h) => {
+        const isPlaylist = h.includes('.m3u8') || h.includes('/playlist') || h.includes('/master');
+        return `URI="${isPlaylist ? proxiedPlaylist(h) : absoluteSegment(h)}"`;
+      }));
+      continue;
+    }
+
+    // Plain segment lines — make absolute, do NOT proxy
+    if (!t.startsWith('#')) {
+      out.push(absoluteSegment(t));
+      continue;
+    }
+
+    out.push(line);
+  }
+
+  return out.join('\n');
+}
+
+async function m3u8OnlyProxy(req: Request, res: Response): Promise<void> {
+  const { targetUrl, upstreamHeaders, headersParam } = parseProxyParams(req);
+  if (!targetUrl) { res.status(400).json({ error: 'Missing url parameter' }); return; }
+
+  const err = validateUrl(targetUrl);
+  if (err) { res.status(400).json({ error: err }); return; }
+
+  try {
+    const upstream = await nativeFetch(targetUrl, upstreamHeaders);
+    const ct       = (upstream.headers['content-type'] as string) ?? '';
+    const isM3U8   = ct.includes('mpegurl') || targetUrl.includes('.m3u8');
+
+    if (isM3U8 && upstream.body.includes('#EXTM3U')) {
+      const proto     = req.get('x-forwarded-proto') || req.protocol;
+      const proxyBase = `${proto}://${req.get('host')}`;
+      const baseUrl   = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+      res.status(upstream.status);
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.send(rewriteM3U8PlaylistsOnly(upstream.body, baseUrl, proxyBase, headersParam ?? ''));
+      return;
+    }
+
+    // Not an M3U8 — pass through as-is
+    res.status(upstream.status);
+    for (const [key, value] of Object.entries(upstream.headers)) {
+      if (value && !STRIP_RESPONSE_HEADERS.has(key.toLowerCase()))
+        res.setHeader(key, value as string | string[]);
+    }
+    res.send(upstream.body);
+  } catch (e: any) {
+    if (!res.headersSent) res.status(502).json({ error: 'Upstream error', message: e?.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Express app
 // ---------------------------------------------------------------------------
 
@@ -336,8 +434,9 @@ app.get('/fetch',      fetchProxy);
 app.get('/subtitle',   fetchProxy);
 app.get('/mp4-proxy',  fetchProxy);
 app.get('/proxy',      fetchProxy);
-app.get('/m3u8-proxy', m3u8Proxy);
-app.get('/ts-proxy',   tsProxy);
+app.get('/m3u8-proxy',      m3u8Proxy);
+app.get('/m3u8-only-proxy', m3u8OnlyProxy);
+app.get('/ts-proxy',        tsProxy);
 
 // ---------------------------------------------------------------------------
 // Start — single process, modest connection ceiling
