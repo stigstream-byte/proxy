@@ -76,15 +76,17 @@ function nativeProxy(
   res: Response,
   headersTimeoutMs = 15_000,
   bodyTimeoutMs    = 30_000,
+  method           = 'GET',
+  incomingReq?:    Request,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
-    const req = modFor(targetUrl).request(
+    const upstreamReq = modFor(targetUrl).request(
       {
         hostname: parsed.hostname,
         port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
         path:     parsed.pathname + parsed.search,
-        method:   'GET',
+        method,
         headers:  upstreamHeaders,
         agent:    agentFor(targetUrl),
       },
@@ -97,18 +99,24 @@ function nativeProxy(
         }
 
         // Single body timeout; no per-chunk timer churn
-        const bodyTimer = setTimeout(() => req.destroy(new Error('Body timeout')), bodyTimeoutMs);
+        const bodyTimer = setTimeout(() => upstreamReq.destroy(new Error('Body timeout')), bodyTimeoutMs);
 
         upstream.pipe(res);
         upstream.on('end',   () => { clearTimeout(bodyTimer); resolve(); });
         upstream.on('error', (e) => { clearTimeout(bodyTimer); reject(e); });
-        res.on('error',      () => { clearTimeout(bodyTimer); req.destroy(); resolve(); });
+        res.on('error',      () => { clearTimeout(bodyTimer); upstreamReq.destroy(); resolve(); });
       },
     );
 
-    req.setTimeout(headersTimeoutMs, () => req.destroy(new Error('Headers timeout')));
-    req.on('error', reject);
-    req.end();
+    upstreamReq.setTimeout(headersTimeoutMs, () => upstreamReq.destroy(new Error('Headers timeout')));
+    upstreamReq.on('error', reject);
+
+    // Pipe request body for methods that carry one
+    if (incomingReq && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
+      incomingReq.pipe(upstreamReq);
+    } else {
+      upstreamReq.end();
+    }
   });
 }
 
@@ -167,7 +175,7 @@ async function fetchProxy(req: Request, res: Response): Promise<void> {
   req.on('close', () => { if (!res.writableEnded) res.destroy(); });
 
   try {
-    await nativeProxy(targetUrl, upstreamHeaders, res);
+    await nativeProxy(targetUrl, upstreamHeaders, res, 15_000, 30_000, req.method, req);
   } catch (e: any) {
     if (!res.headersSent) res.status(502).json({ error: 'Upstream error', message: e?.message });
   }
@@ -187,12 +195,12 @@ async function tsProxy(req: Request, res: Response): Promise<void> {
   req.on('close', () => { if (!res.writableEnded) res.destroy(); });
 
   try {
-    await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000);
+    await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000, req.method, req);
   } catch (e: any) {
     if (e?.name === 'AbortError') return;
     if (!res.headersSent) {
       try {
-        await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000);
+        await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000, req.method, req);
       } catch (re: any) {
         if (!res.headersSent) res.status(502).json({ error: 'Upstream error', message: re?.message });
       }
@@ -430,13 +438,13 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
 
 // Routes
 app.get('/health',     (_req, res) => res.json({ ok: true }));
-app.get('/fetch',      fetchProxy);
-app.get('/subtitle',   fetchProxy);
-app.get('/mp4-proxy',  fetchProxy);
-app.get('/proxy',      fetchProxy);
-app.get('/m3u8-proxy',      m3u8Proxy);
-app.get('/m3u8-only-proxy', m3u8OnlyProxy);
-app.get('/ts-proxy',        tsProxy);
+app.all('/fetch',      fetchProxy);
+app.all('/subtitle',   fetchProxy);
+app.all('/mp4-proxy',  fetchProxy);
+app.all('/proxy',      fetchProxy);
+app.all('/m3u8-proxy',      m3u8Proxy);
+app.all('/m3u8-only-proxy', m3u8OnlyProxy);
+app.all('/ts-proxy',        tsProxy);
 
 // ---------------------------------------------------------------------------
 // Start — single process, modest connection ceiling
