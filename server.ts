@@ -66,8 +66,12 @@ const STRIP_RESPONSE_HEADERS = new Set([
   'content-length',
 ]);
 
+// Redirect statuses we transparently follow upstream (the client never sees them)
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 // ---------------------------------------------------------------------------
 // Native proxy — pipes upstream response directly into Express res
+// Follows up to `maxRedirects` upstream redirects (off by default).
 // ---------------------------------------------------------------------------
 
 function nativeProxy(
@@ -78,6 +82,7 @@ function nativeProxy(
   bodyTimeoutMs    = 30_000,
   method           = 'GET',
   incomingReq?:    Request,
+  maxRedirects     = 0,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(targetUrl);
@@ -91,7 +96,43 @@ function nativeProxy(
         agent:    agentFor(targetUrl),
       },
       (upstream) => {
-        res.statusCode = upstream.statusCode ?? 502;
+        const status = upstream.statusCode ?? 502;
+
+        // ---- Follow upstream redirects transparently ----
+        const location = upstream.headers.location;
+        if (REDIRECT_STATUSES.has(status) && location && maxRedirects > 0) {
+          // Drain this response so the socket can return to the pool
+          upstream.resume();
+
+          let nextUrl: string;
+          try {
+            nextUrl = new URL(Array.isArray(location) ? location[0] : location, targetUrl).href;
+          } catch {
+            reject(new Error('Invalid redirect Location'));
+            return;
+          }
+
+          // Re-validate the redirect target — SSRF protection must apply here too
+          const ssrf = validateUrl(nextUrl);
+          if (ssrf) { reject(new Error(`Blocked redirect target: ${ssrf}`)); return; }
+
+          // 303 always becomes GET; 301/302 conventionally become GET for non-GET/HEAD
+          let nextMethod = method;
+          if (status === 303 ||
+              ((status === 301 || status === 302) && method !== 'GET' && method !== 'HEAD')) {
+            nextMethod = 'GET';
+          }
+
+          nativeProxy(
+            nextUrl, upstreamHeaders, res,
+            headersTimeoutMs, bodyTimeoutMs, nextMethod,
+            undefined,                 // body (if any) was already consumed on the first hop
+            maxRedirects - 1,
+          ).then(resolve, reject);
+          return;
+        }
+
+        res.statusCode = status;
 
         for (const [key, value] of Object.entries(upstream.headers)) {
           if (value && !STRIP_RESPONSE_HEADERS.has(key.toLowerCase()))
@@ -195,12 +236,12 @@ async function tsProxy(req: Request, res: Response): Promise<void> {
   req.on('close', () => { if (!res.writableEnded) res.destroy(); });
 
   try {
-    await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000, req.method, req);
+    await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000, req.method, req, 5);
   } catch (e: any) {
     if (e?.name === 'AbortError') return;
     if (!res.headersSent) {
       try {
-        await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000, req.method, req);
+        await nativeProxy(targetUrl, upstreamHeaders, res, 20_000, 30_000, req.method, req, 5);
       } catch (re: any) {
         if (!res.headersSent) res.status(502).json({ error: 'Upstream error', message: re?.message });
       }
