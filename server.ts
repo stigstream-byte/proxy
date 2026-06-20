@@ -32,6 +32,68 @@ function modFor(url: string): typeof http | typeof https {
 }
 
 // ---------------------------------------------------------------------------
+// Live metrics — in-process counters powering /stats
+// ---------------------------------------------------------------------------
+
+const startedAt = Date.now();
+
+interface EndpointMetric { inFlight: number; total: number; errors: number; }
+
+const metrics = {
+  inFlight: 0,            // requests being proxied right now (app-level "active connections")
+  clientConnections: 0,  // open client TCP sockets (socket-level)
+  totalRequests: 0,
+  totalErrors: 0,
+  byEndpoint: {} as Record<string, EndpointMetric>,
+};
+
+// Collapse arbitrary paths down to the known proxy routes so the map stays small.
+const KNOWN_ROUTES = new Set([
+  '/health', '/stats', '/fetch', '/subtitle', '/mp4-proxy', '/proxy',
+  '/m3u8-proxy', '/m3u8-only-proxy', '/ts-proxy',
+]);
+function endpointKey(path: string): string {
+  return KNOWN_ROUTES.has(path) ? path : 'other';
+}
+
+// Express middleware: count a request while it's in flight, decrement when it
+// finishes or the client disconnects. /stats is skipped so polling it doesn't
+// skew the numbers.
+function trackRequest(req: Request, res: Response, next: NextFunction): void {
+  if (req.path === '/stats') { next(); return; }
+
+  const key = endpointKey(req.path);
+  const ep = (metrics.byEndpoint[key] ??= { inFlight: 0, total: 0, errors: 0 });
+
+  metrics.inFlight++; metrics.totalRequests++;
+  ep.inFlight++;      ep.total++;
+
+  let settled = false;
+  const done = () => {
+    if (settled) return;
+    settled = true;
+    metrics.inFlight--;
+    ep.inFlight--;
+    if (res.statusCode >= 500) { metrics.totalErrors++; ep.errors++; }
+  };
+  res.on('finish', done);
+  res.on('close', done);
+  next();
+}
+
+// Snapshot of a keep-alive agent's socket pool (active / idle / queued upstream).
+function agentStats(agent: http.Agent) {
+  const count = (m: unknown) =>
+    m ? Object.values(m as Record<string, unknown[]>).reduce((s, arr) => s + arr.length, 0) : 0;
+  const a = agent as unknown as { sockets?: unknown; freeSockets?: unknown; requests?: unknown };
+  return {
+    activeSockets:  count(a.sockets),
+    freeSockets:    count(a.freeSockets),
+    queuedRequests: count(a.requests),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // URL validation — SSRF protection
 // ---------------------------------------------------------------------------
 
@@ -477,8 +539,42 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+// In-flight request accounting (must run before the route handlers)
+app.use(trackRequest);
+
 // Routes
 app.get('/health',     (_req, res) => res.json({ ok: true }));
+app.get('/stats',      (req, res) => {
+  // Optional guard: set STATS_TOKEN to require ?token= or an x-stats-token header.
+  const token = process.env.STATS_TOKEN;
+  if (token && req.get('x-stats-token') !== token && req.query.token !== token) {
+    res.status(401).json({ error: 'unauthorized' });
+    return;
+  }
+
+  const mem = process.memoryUsage();
+  res.json({
+    ok: true,
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+    // Two views of "active connections" — pick whichever matches your model:
+    //   activeRequests    = requests currently being proxied (app-level)
+    //   clientConnections = open client TCP sockets (socket-level)
+    activeRequests: metrics.inFlight,
+    clientConnections: metrics.clientConnections,
+    totalRequests: metrics.totalRequests,
+    totalErrors: metrics.totalErrors,
+    byEndpoint: metrics.byEndpoint,
+    upstreamPools: {
+      http:  agentStats(httpAgent),
+      https: agentStats(httpsAgent),
+    },
+    memory: {
+      rssMB:      +(mem.rss / 1048576).toFixed(1),
+      heapUsedMB: +(mem.heapUsed / 1048576).toFixed(1),
+    },
+  });
+});
 app.all('/fetch',      fetchProxy);
 app.all('/subtitle',   fetchProxy);
 app.all('/mp4-proxy',  fetchProxy);
@@ -493,5 +589,9 @@ app.all('/ts-proxy',        tsProxy);
 
 const server = http.createServer(app);
 server.maxConnections = 512;
-server.on('connection', (s) => s.setNoDelay(true));
+server.on('connection', (s) => {
+  s.setNoDelay(true);
+  metrics.clientConnections++;
+  s.on('close', () => { metrics.clientConnections--; });
+});
 server.listen(PORT, () => console.log(`Proxy on port ${PORT}`));
