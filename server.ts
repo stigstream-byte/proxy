@@ -344,6 +344,19 @@ function rewriteM3U8(content: string, baseUrl: string, proxyBase: string, header
       continue;
     }
 
+    // #EXT-X-MEDIA — audio/video/subtitle rendition URI is ALWAYS a media playlist
+    if (t.startsWith('#EXT-X-MEDIA')) {
+      out.push(t.replace(/URI="([^"]+)"/g, (_m, h) => `URI="${proxied(h, '/m3u8-proxy')}"`));
+      continue;
+    }
+
+    // #EXT-X-I-FRAME-STREAM-INF — also a playlist URI
+    if (t.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
+      out.push(t.replace(/URI="([^"]+)"/g, (_m, h) => `URI="${proxied(h, '/m3u8-proxy')}"`));
+      continue;
+    }
+
+    // Other tags with URI="" (e.g. #EXT-X-KEY) — keep the heuristic
     if (t.startsWith('#') && t.includes('URI="')) {
       out.push(t.replace(/URI="([^"]+)"/g, (_m, h) => {
         const isPlaylist = h.includes('.m3u8') || h.includes('/playlist') || h.includes('/master');
