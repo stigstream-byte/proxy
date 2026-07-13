@@ -12,6 +12,7 @@ dotenv.config();
 import express, { Request, Response, NextFunction } from 'express';
 import * as http  from 'http';
 import * as https from 'https';
+import { encrypt, decrypt } from './encrypt';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -50,6 +51,12 @@ const metrics = {
 // Collapse arbitrary paths down to the known proxy routes so the map stays small.
 const KNOWN_ROUTES = new Set([
   '/health', '/stats', '/fetch', '/subtitle', '/mp4-proxy', '/proxy',
+  '/m3u8-proxy', '/m3u8-only-proxy', '/ts-proxy',
+]);
+
+// Only these endpoints are encrypted (token-only). The rest — /fetch,
+// /subtitle, /mp4-proxy, /proxy — stay plaintext and are used normally.
+const ENCRYPTED_ENDPOINTS = new Set([
   '/m3u8-proxy', '/m3u8-only-proxy', '/ts-proxy',
 ]);
 function endpointKey(path: string): string {
@@ -319,6 +326,11 @@ function rewriteM3U8(content: string, baseUrl: string, proxyBase: string, header
   function proxied(href: string, endpoint: string): string {
     let abs: string;
     try { abs = new URL(href, baseUrl).href; } catch { abs = href; }
+    if (ENCRYPTED_ENDPOINTS.has(endpoint)) {
+      const token = encrypt({ e: endpoint, u: abs, h: headersParam || undefined });
+      return `${proxyBase}/${token}`;
+    }
+    // Non-encrypted endpoints (e.g. /fetch for #EXT-X-KEY) stay plaintext
     let qs = `url=${encodeURIComponent(abs)}`;
     if (headersParam) qs += `&headers=${encodeURIComponent(headersParam)}`;
     return `${proxyBase}${endpoint}?${qs}`;
@@ -446,9 +458,8 @@ function rewriteM3U8PlaylistsOnly(content: string, baseUrl: string, proxyBase: s
   function proxiedPlaylist(href: string): string {
     let abs: string;
     try { abs = new URL(href, baseUrl).href; } catch { abs = href; }
-    let qs = `url=${encodeURIComponent(abs)}`;
-    if (headersParam) qs += `&headers=${encodeURIComponent(headersParam)}`;
-    return `${proxyBase}/m3u8-only-proxy?${qs}`;
+    const token = encrypt({ e: '/m3u8-only-proxy', u: abs, h: headersParam || undefined });
+    return `${proxyBase}/${token}`;
   }
 
   function absoluteSegment(href: string): string {
@@ -552,6 +563,36 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+// ---------------------------------------------------------------------------
+// Endpoint decryption — turn an incoming `/<TOKEN>` back into the real route.
+// Runs before metrics/routing so a token dispatches to the existing handlers
+// (and shows up under the right per-endpoint metric) with zero handler changes.
+// A valid token also flags the request as authorized (see proxyGuard below).
+// ---------------------------------------------------------------------------
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  const path = req.path;
+
+  // Skip real routes and anything that isn't a single opaque path segment.
+  if (path === '/' || KNOWN_ROUTES.has(path) || path.indexOf('/', 1) !== -1) return next();
+
+  const payload = decrypt(path.slice(1));
+  if (!payload || !ENCRYPTED_ENDPOINTS.has(payload.e)) return next(); // falls through to 404
+
+  // Express already parsed req.query from the token URL (→ {}), so set it
+  // directly; rewrite req.url only so the router matches the real endpoint.
+  req.url = payload.e;
+  req.query = payload.h ? { url: payload.u, headers: payload.h } : { url: payload.u };
+  (req as any).authorized = true;
+  next();
+});
+
+// Reject direct plaintext access to the proxy routes — only decrypted tokens
+// (which set `authorized`) may reach them. 404 keeps the routes unadvertised.
+function proxyGuard(req: Request, res: Response, next: NextFunction): void {
+  if ((req as any).authorized) { next(); return; }
+  res.status(404).end();
+}
+
 // In-flight request accounting (must run before the route handlers)
 app.use(trackRequest);
 
@@ -592,9 +633,9 @@ app.all('/fetch',      fetchProxy);
 app.all('/subtitle',   fetchProxy);
 app.all('/mp4-proxy',  fetchProxy);
 app.all('/proxy',      fetchProxy);
-app.all('/m3u8-proxy',      m3u8Proxy);
-app.all('/m3u8-only-proxy', m3u8OnlyProxy);
-app.all('/ts-proxy',        tsProxy);
+app.all('/m3u8-proxy',      proxyGuard, m3u8Proxy);
+app.all('/m3u8-only-proxy', proxyGuard, m3u8OnlyProxy);
+app.all('/ts-proxy',        proxyGuard, tsProxy);
 
 // ---------------------------------------------------------------------------
 // Start — single process, modest connection ceiling
