@@ -256,11 +256,21 @@ function parseProxyParams(req: Request): {
     else if (value)           upstreamHeaders[key] = value;
   }
 
-  // Custom headers from ?headers=... override/extend the above
+  // Custom headers from ?headers=... override/extend the above. Node lowercases
+  // forwarded header names, so a custom "User-Agent" would NOT replace the
+  // client's "user-agent" — both would be sent upstream, and many origins
+  // reject the duplicate (e.g. 424). Match case-insensitively so the custom
+  // value truly overrides instead of duplicating.
   if (headersParam) {
     try {
       const custom = JSON.parse(headersParam) as Record<string, string>;
-      Object.assign(upstreamHeaders, custom);
+      for (const [k, v] of Object.entries(custom)) {
+        const lk = k.toLowerCase();
+        for (const existing of Object.keys(upstreamHeaders)) {
+          if (existing.toLowerCase() === lk) delete upstreamHeaders[existing];
+        }
+        upstreamHeaders[k] = v;
+      }
     } catch { /* ignore malformed */ }
   }
 
