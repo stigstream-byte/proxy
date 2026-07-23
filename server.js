@@ -8,6 +8,8 @@ import { attachStatsMiddleware, getStatsSnapshot } from './lib/stats.js';
 
 const app = express();
 
+app.set('trust proxy', true);
+
 // Capture every request body as a raw Buffer regardless of Content-Type -
 // we don't want to parse/transform it, just forward it upstream untouched.
 app.use(express.raw({ type: () => true, limit: '50mb' }));
